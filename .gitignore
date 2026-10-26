@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.latex-draft-backups/
+*.latex-draft.json
+*.aux
+*.log
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.pdf
+!examples/*.pdf
