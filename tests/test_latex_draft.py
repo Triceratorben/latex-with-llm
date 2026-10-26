@@ -4,7 +4,6 @@ import unittest
 from pathlib import Path
 
 from tools.latex_draft import (
-    BACKUP_INTERVAL_S,
     BLOCK_RE,
     build_block,
     ensure_changes_package,
@@ -15,6 +14,11 @@ from tools.latex_draft import (
     resolve_drafts,
     snapshot,
 )
+
+
+def _note_of(snap):
+    note_file = snap.with_suffix(snap.suffix + ".note")
+    return note_file.read_text().strip() if note_file.exists() else ""
 
 PAPER = """\\documentclass{article}
 \\title{A Small Paper}
@@ -210,6 +214,58 @@ class TestResolve(LatexDraftCase):
     def test_accept_unknown_id_fails(self):
         self.assertEqual(self.run_cli("accept", "--id", "deadbeef"), 2)
 
+    def test_overlapping_alternatives_resolve_together(self):
+        # two alternative drafts for the same replacement: accepting one
+        # consumes both blocks; the sibling is resolved as rejected
+        rc = self.run_cli(
+            "draft-replace",
+            "--old",
+            "Small problems are worth studying.",
+            "--new",
+            "Version A.",
+        )
+        self.assertEqual(rc, 0)
+        id_a = self.draft_ids()[0]
+        rc = self.run_cli(
+            "draft-replace",
+            "--old",
+            "Small problems are worth studying.",
+            "--new",
+            "Version B.",
+        )
+        self.assertEqual(rc, 0, "drafting an alternative over a pending draft must work")
+        id_b = [d for d in self.draft_ids() if d != id_a][0]
+        rc = self.run_cli("accept", "--id", id_a)
+        self.assertEqual(rc, 0)
+        self.assertIn("Version A.", self.tex.read_text())
+        self.assertNotIn("Version B.", self.tex.read_text())
+        self.assertEqual(self.state()["drafts"][id_a]["status"], "accepted")
+        self.assertEqual(self.state()["drafts"][id_b]["status"], "rejected")
+        # rejecting the sibling afterwards is a clean error (already resolved)
+        self.assertEqual(self.run_cli("reject", "--id", id_b), 2)
+
+    def test_draft_over_pending_block_refused(self):
+        self.run_cli(
+            "draft-replace",
+            "--old",
+            "Small problems are worth studying.",
+            "--new",
+            "Version A.",
+        )
+        # inserting into the middle of a pending draft block is refused
+        rc = self.run_cli(
+            "draft-insert",
+            "--after",
+            "Small problems are worth studying.",
+            "--text",
+            "Side note.",
+        )
+        self.assertEqual(rc, 2)
+
+    def test_replace_old_must_be_unique_outside_drafts(self):
+        rc = self.run_cli("draft-replace", "--old", "o", "--new", "x")
+        self.assertEqual(rc, 2)
+
     def test_double_resolve_fails(self):
         self.run_cli("draft-insert", "--at-line", "1", "--text", "one.")
         did = self.draft_ids()[0]
@@ -254,24 +310,28 @@ class TestBackups(LatexDraftCase):
     def test_every_mutation_snapshots(self):
         self.run_cli("draft-insert", "--at-line", "1", "--text", "one.")
         self.run_cli("draft-insert", "--at-line", "1", "--text", "two.")
-        self.assertEqual(len(list_snapshots(self.tex)), 2)
+        # 1 full initial backup + 1 per mutation
+        self.assertEqual(len(list_snapshots(self.tex)), 3)
 
-    def test_periodic_backup_only_after_interval(self):
-        self.tex.write_text(PAPER)
-        snapshot(self.tex)
-        state = self.state()
-        state["last_backup"] = time.time()
-        from tools.latex_draft import save_state
-
-        save_state(self.tex, state)
+    def test_compile_takes_per_turn_backup(self):
+        self.run_cli("status")  # first use: full initial backup
         before = len(list_snapshots(self.tex))
-        self.run_cli("draft-insert", "--at-line", "1", "--text", "x.")
-        # manual mutation snapshot only; periodic one suppressed
+        self.run_cli("compile")
         self.assertEqual(len(list_snapshots(self.tex)), before + 1)
-        state["last_backup"] = time.time() - BACKUP_INTERVAL_S - 1
-        save_state(self.tex, state)
-        self.run_cli("draft-insert", "--at-line", "1", "--text", "y.")
-        self.assertEqual(len(list_snapshots(self.tex)), before + 3)
+        self.assertEqual(self.state()["turn"], 1)
+        self.run_cli("compile")
+        self.assertEqual(len(list_snapshots(self.tex)), before + 2)
+        self.assertEqual(self.state()["turn"], 2)
+
+    def test_full_initial_backup_includes_inputs(self):
+        chapter = self.dir / "chapter1.tex"
+        chapter.write_text("\\section{One}\n")
+        self.tex.write_text(PAPER.replace("\\end{document}", "\\input{chapter1}\n\\end{document}"))
+        self.run_cli("list")  # first use triggers the full initial backup
+        snaps = list_snapshots(self.tex)
+        self.assertEqual(len(snaps), 1)  # exactly the full initial backup
+        deps = list((self.dir / ".latex-draft-backups" / self.tex.name).glob(f"{snaps[0].stem}__*.tex"))
+        self.assertEqual([d.name.split("__", 1)[1] for d in deps], ["chapter1.tex"])
 
     def test_undo_restores(self):
         original = self.tex.read_text()
@@ -284,16 +344,116 @@ class TestBackups(LatexDraftCase):
         self.run_cli("undo", "--n", "5")
         self.assertEqual(self.tex.read_text(), original)
 
-    def test_undo_without_backups_fails(self):
+    def test_undo_without_changes_fails(self):
         self.assertEqual(self.run_cli("undo"), 1)
 
     def test_manual_backup_with_note(self):
         rc = self.run_cli("backup", "--note", "before big edit")
         self.assertEqual(rc, 0)
-        snaps = list_snapshots(self.tex)
-        self.assertEqual(len(snaps), 1)
-        note = snaps[0].with_suffix(snaps[0].suffix + ".note")
-        self.assertEqual(note.read_text().strip(), "before big edit")
+        all_snaps = list_snapshots(self.tex)
+        self.assertEqual(len(all_snaps), 2)  # full initial + manual
+        self.assertEqual(_note_of(all_snaps[0]), "before big edit")
+        self.assertIn("initial backup", _note_of(all_snaps[1]))
+
+
+class TestChangelog(LatexDraftCase):
+    def test_changes_are_recorded(self):
+        from tools.latex_draft import read_changelog
+
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
+        self.run_cli("accept", "--all")
+        entries = [e for e in read_changelog(self.tex) if e["kind"] == "change"]
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0]["turn"], 0)
+        self.assertIn("draft insert", entries[0]["note"])
+
+    def test_undo_turn_reverts_whole_turn(self):
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "two.")
+        self.run_cli("compile")  # ends turn 1
+        self.assertEqual(self.state()["turn"], 1)
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "three.")
+        rc = self.run_cli("undo", "--turn")
+        self.assertEqual(rc, 0)
+        text = self.tex.read_text()
+        self.assertNotIn("three.", text)
+        self.assertIn("one.", text)
+        self.assertIn("two.", text)
+
+    def test_undo_turn_without_changes(self):
+        # no changes recorded at all -> error
+        self.assertEqual(self.run_cli("undo", "--turn"), 1)
+
+    def test_undo_turn_after_compile_reverts_last_active_turn(self):
+        # changes in turn 0, compile ends the turn; `undo --turn` should still
+        # revert that turn (the common "undo my last turn" case)
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
+        self.run_cli("compile")
+        self.assertEqual(self.state()["turn"], 1)
+        rc = self.run_cli("undo", "--turn")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("one.", self.tex.read_text())
+
+    def test_changelog_command_lists_entries(self):
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
+        self.assertEqual(self.run_cli("changelog"), 0)
+
+    def test_undo_records_undo_entry(self):
+        from tools.latex_draft import read_changelog
+
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
+        self.run_cli("undo")
+        kinds = [e["kind"] for e in read_changelog(self.tex)]
+        self.assertEqual(kinds, ["change", "undo"])
+
+
+class TestExternalEdits(LatexDraftCase):
+    def test_hand_edit_detected_and_adopted_at_turn_start(self):
+        from tools.latex_draft import read_changelog
+
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
+        # simulate the user editing the file by hand between turns
+        text = self.tex.read_text()
+        self.tex.write_text(text.replace("worth studying", "worth studying deeply"))
+        self.run_cli("status")  # turn start: should warn and adopt
+        entries = [e for e in read_changelog(self.tex) if e["kind"] == "external"]
+        self.assertEqual(len(entries), 1)
+        self.assertIn("changed outside latex-draft", entries[0]["note"])
+        # after adoption, a new change proceeds without aborting
+        rc = self.run_cli("draft-insert", "--at-line", "5", "--text", "two.")
+        self.assertEqual(rc, 0)
+        self.assertIn("worth studying deeply", self.tex.read_text())
+
+    def test_hand_edit_during_mutation_aborts(self):
+        from tools import latex_draft
+
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
+        original = self.tex.read_text()
+
+        def sneaky_fn(text):
+            # simulate a hand edit landing while the change is computed
+            self.tex.write_text(text + "\n% hand edit\n")
+            return text + "\n% drafted by tool\n"
+
+        state = self.state()
+        with self.assertRaises(latex_draft.DraftError):
+            latex_draft.mutate(self.tex, state, "test", sneaky_fn)
+        # file content is whatever the hand edit left; tool did not clobber
+        self.assertIn("hand edit", self.tex.read_text())
+        self.assertNotEqual(self.tex.read_text(), original + "\n% drafted by tool\n")
+
+    def test_hand_edit_of_input_file_detected(self):
+        chapter = self.dir / "chapter1.tex"
+        chapter.write_text("\\section{One}\n")
+        self.tex.write_text(PAPER.replace("\\end{document}", "\\input{chapter1}\n\\end{document}"))
+        self.run_cli("status")  # establishes hashes
+        chapter.write_text("\\section{One, edited by hand}\n")
+        from tools.latex_draft import check_external_changes
+
+        state = self.state()
+        warning = check_external_changes(self.tex, state)
+        self.assertIsNotNone(warning)
+        self.assertIn("chapter1.tex", warning)
 
 
 class TestCompileAndStatus(LatexDraftCase):

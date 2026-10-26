@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .latex-draft-backups/
 *.latex-draft.json
+*.latex-draft-changes.jsonl
 *.aux
 *.log
 *.out

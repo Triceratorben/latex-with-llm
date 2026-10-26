@@ -48,7 +48,14 @@ deletions struck through — the user inspects the PDF and decides.
 
 1. **Receive** the user's instruction (text; voice is transcribed upstream —
    irrelevant to the tool).
-2. **Read the document** (`cat` the `.tex` file) to find anchors.
+2. **Turn-start safety check.** The first tool call of every turn already
+   verifies that the `.tex` file (and every file it pulls in via
+   `\input`/`\include`) has not been edited by hand since the end of the
+   last turn; if it has, the tool prints a `WARNING` and records the edit
+   in the changelog. **Read that warning carefully** and re-read the file
+   (`status`, `changelog`, `cat`) before drafting anything, because your
+   anchors may have moved.
+3. **Read the document** (`cat` the `.tex` file) to find anchors.
 3. **Draft** the change. Always draft first; never write final text directly.
    - Insert: `latex-draft draft-insert --after "<unique line>" --text "..."`
      (or `--before` / `--at-line N`; the anchor must match exactly one line)
@@ -63,7 +70,9 @@ deletions struck through — the user inspects the PDF and decides.
   relevant anchor (`--after "<unique line>"`), e.g. "TODO: needs citation",
   "This claim contradicts Section 2", "Consider splitting this paragraph".
 4. **Compile** (mandatory end of turn): `latex-draft compile`.
-   A PDF inspector/viewer shows the updated PDF automatically.
+   A PDF inspector/viewer shows the updated PDF automatically. Compiling
+   also ends the turn: it takes the per-turn backup and bumps the turn
+   counter, so `undo --turn` can revert everything you did this turn.
 5. **Report** draft ids and previews, and ask the user which to accept.
 
 ## Resolving drafts (next turn, after the user looks at the PDF)
@@ -72,24 +81,63 @@ deletions struck through — the user inspects the PDF and decides.
 - `latex-draft accept --id <id>` or `--all` — merge into the `.tex` **without**
   any `changes` markup or marker comments.
 - `latex-draft reject --id <id>` or `--all` — restore the original text.
-- End the turn with `latex-draft compile` again.
+- End the turn with `latex-draft compile` again. (If the user asks to undo
+  something, use `latex-draft undo --n K` or `undo --turn`, then `compile`.)
 
-## Backups and undo (automatic)
+## Change log and undo
 
-- A timestamped snapshot is taken before **every** mutation (draft, accept,
-  reject) in `.latex-draft-backups/<file.tex>/`.
-- An automatic snapshot is taken at most every 5 minutes while editing.
-- Retention: all snapshots < 1 h, one per hour for 24 h, one per day for 30 d.
+Every change the tool makes is appended to an append-only changelog
+(`<file.tex>.latex-draft-changes.jsonl`) with the full content before and
+after, so **any change can be undone individually** — even ones made turns
+ago — and the whole history is inspectable.
+
+- `latex-draft changelog [--last N]` — show the change log.
+- `latex-draft undo --n K` — revert the K most recent changes (replays the
+  recorded before-content).
+- `latex-draft undo --turn` — revert **all** changes of the current turn.
+- `latex-draft status` — summary; also warns if the file was edited by hand.
+
+## Backups (automatic)
+
+- On **first use** on a file, a full initial backup is taken: the main file
+  plus every file it pulls in via `\input`/`\include` (kept forever).
+- A snapshot is taken before **every** mutation (draft, accept, reject) and
+  **once per turn** when the turn ends with `compile`.
+- Retention: all snapshots < 1 h, one per hour for 24 h, one per day for 30 d
+  (the full initial backup is never pruned).
 - `latex-draft backup --note "..."` — manual snapshot.
-- `latex-draft undo --n K` — restore the K-th most recent snapshot.
-- `latex-draft backups` / `latex-draft status` — inspect snapshots and state.
-- Per-file state (draft ids, statuses) lives in `<file.tex>.latex-draft.json`.
+- `latex-draft backups` — list snapshots.
+- Per-file state (draft ids, statuses, file hashes, turn counter) lives in
+  `<file.tex>.latex-draft.json`.
+
+## Robustness against hand edits
+
+The user may edit the `.tex` file directly, even mid-turn:
+
+- **Between turns**: detected automatically at the start of the next tool
+  call (content hashes of the main file and its `\input`/`\include`
+  dependencies). The edit is recorded in the changelog as an `external`
+  entry, the new state is adopted, and the agent is warned to re-read the
+  file.
+- **During a tool call**: a hash re-check happens immediately before every
+  write; if the file changed while the change was being prepared, the write
+  is **aborted** and the user's edit is never clobbered.
+
+## Session start
+
+At the beginning of a conversation (before the first edit), run
+`latex-draft <file.tex> status` — this takes the full initial backup on first
+use and confirms the document state. If the document has no state yet, also
+run `latex-draft <file.tex> backup --note "session start"` for an explicit,
+named restore point.
 
 ## Rules
 
-- One turn = user input → drafted change(s) via the tool → `compile`.
+- One turn = user input → turn-start check → drafted change(s) via the
+  tool → `compile`.
 - Anchors (`--after`/`--before`/`--old`) must be unique in the file; if a
   match is not unique, re-read the file and use a longer anchor or
   `--at-line`.
 - Keep drafted LaTeX idiomatic; escape `%`, `&`, `#`, `_` etc. as needed.
-- Do not commit backups, state files, or build artifacts (see `.gitignore`).
+- Do not commit backups, state files, changelogs, or build artifacts (see
+  `.gitignore`).
