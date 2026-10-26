@@ -20,8 +20,9 @@ The skill has two modes, declared at the start of a conversation (see
 `SKILL.md`): **Writer** (drafts actual text changes) and **Commenter** (only
 adds drafted footnotes — never alters the body text). In Writer mode the
 agent follows scientific-writing practices: it defaults to drafting several
-versions, avoids unsubstantiated claims, and pushes back when an instruction
-seems wrong.
+versions, avoids unsubstantiated claims, pushes back when an instruction
+seems wrong, and asks 2–4 concrete clarifying questions instead of drafting
+when an instruction is too vague (e.g. "make the paper").
 
 ## Layout
 

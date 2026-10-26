@@ -30,6 +30,9 @@ switches. The mode is a promise about *how* you may use the tool.
 - **Push back.** If an instruction is factually wrong, inconsistent with the
   rest of the document, or would damage the argument, say so plainly *before*
   drafting, and offer the corrected alternative. Never silently comply.
+- **Ask instead of guessing.** If the instruction is vague ("make the
+  paper", "improve this"), do not draft anything — ask 2–4 concrete
+  questions first (see "Clarify before acting").
 
 ## The one tool this skill relies on
 
@@ -44,10 +47,41 @@ comments. The document preamble is auto-augmented with
 `\usepackage[draft]{changes}`, so recompiling shows additions in green and
 deletions struck through — the user inspects the PDF and decides.
 
+## Clarify before acting (vague instructions)
+
+**Do not carry out a turn — do not call any mutating tool command and do not
+`compile` — if the instruction is not detailed enough to act on.** Vague
+requests such as "make the paper", "write something", "improve this section",
+or "fix it" must trigger clarification instead of drafting.
+
+When the instruction is vague:
+
+1. **Stop.** Make no tool calls that change anything. (Read-only calls like
+   `status`, `list`, `changelog`, or `cat`-ing the file are fine and often
+   help you ask better questions.)
+2. **Ask 2–4 concrete questions** that turn the vague request into an
+   actionable one. Good questions name the *what*, *where*, and *how*:
+   - *What*: "Should I add a motivation paragraph, a methods section, or
+     both?"
+   - *Where*: "After the abstract, or at the end of the introduction?"
+   - *How*: "Formal survey tone, or conversational? Roughly how long?"
+   - *Scope*: "Just this section, or the whole paper?"
+3. **Offer a concrete proposal** the user can approve with one word, e.g.
+   "Say the word and I'll draft 2 versions of a 3-sentence motivation
+   paragraph after the abstract."
+4. Only when the user's answer makes the request specific, start the turn
+   protocol below.
+
+A request is specific enough when you can name: the exact text or location to
+change, what the new text should say (or the concrete options to draft), and
+the scope. "Add a sentence about X after the abstract" is specific; "make the
+paper better" is not.
+
 ## Turn protocol (strictly one per user request)
 
 1. **Receive** the user's instruction (text; voice is transcribed upstream —
-   irrelevant to the tool).
+   irrelevant to the tool). If it is vague, follow "Clarify before acting"
+   above and end the turn with questions — no drafting, no `compile`.
 2. **Turn-start safety check.** The first tool call of every turn already
    verifies that the `.tex` file (and every file it pulls in via
    `\input`/`\include`) has not been edited by hand since the end of the
