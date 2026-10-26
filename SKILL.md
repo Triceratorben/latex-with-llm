@@ -77,46 +77,114 @@ change, what the new text should say (or the concrete options to draft), and
 the scope. "Add a sentence about X after the abstract" is specific; "make the
 paper better" is not.
 
-## Turn protocol (strictly one per user request)
+## The conversation loop (state machine)
 
-1. **Receive** the user's instruction (text; voice is transcribed upstream —
-   irrelevant to the tool). If it is vague, follow "Clarify before acting"
-   above and end the turn with questions — no drafting, no `compile`.
-2. **Turn-start safety check.** The first tool call of every turn already
-   verifies that the `.tex` file (and every file it pulls in via
-   `\input`/`\include`) has not been edited by hand since the end of the
-   last turn; if it has, the tool prints a `WARNING` and records the edit
-   in the changelog. **Read that warning carefully** and re-read the file
-   (`status`, `changelog`, `cat`) before drafting anything, because your
-   anchors may have moved.
-3. **Read the document** (`cat` the `.tex` file) to find anchors.
-3. **Draft** the change. Always draft first; never write final text directly.
+The whole conversation is a loop over four states. **Know which state you
+are in before every tool call — each state has its own allowed commands.**
+
+```
+SESSION START ──► IDLE ──► TURN ──► REVIEW ──► RESOLVE ──► IDLE ──► ...
+                     ▲          │                     │
+                     │          │ user says "undo"    │
+                     └──────────┴─────────────────────┘
+```
+
+### State 0: SESSION START (once per conversation)
+
+Run before the first edit:
+
+- `latex-draft <file> status` — takes the full initial backup on first use,
+  confirms document state.
+- `latex-draft <file> backup --note "session start"` — explicit named
+  restore point (recommended when the file has no tool state yet).
+
+Allowed: `status`, `backup`. Nothing else is needed here.
+
+### State 1: IDLE (waiting for the user)
+
+The user sends an instruction. Decide first:
+
+- **Vague?** → follow "Clarify before acting": ask 2–4 questions, offer a
+  proposal, end the turn. **No drafting, no `compile`.** Stay in IDLE.
+- **About pending drafts** ("keep the first one", "accept all",
+  "reject that", "undo")? → go to RESOLVE.
+- **A specific editing request?** → go to TURN.
+- **A question about the document or the tool state** ("what changed?",
+  "show my drafts")? → answer with read-only commands and stay in IDLE.
+
+Allowed in IDLE: read-only commands only — `status`, `list`, `changelog`,
+`backups` — plus reading the `.tex` file. **Never** `draft-*`, `accept`,
+`reject`, `undo`, or `compile` in IDLE.
+
+### State 2: TURN (drafting a change)
+
+One user request = one turn. Execute in this order:
+
+1. **Turn-start safety check.** The first tool call of the turn verifies
+   that the `.tex` file (and every `\input`/`\include` dependency) has not
+   been edited by hand since the last turn. If the tool prints a `WARNING`,
+   **read it carefully** and re-read the file (`status`, `changelog`,
+   `cat`) before drafting — your anchors may have moved.
+2. **Read the document** (`cat` the `.tex` file) to find anchors.
+3. **Draft** the change. Always draft first; never write final text
+   directly. (Mode rules apply: Writer may draft anything, Commenter only
+   `draft-comment`.)
    - Insert: `latex-draft draft-insert --after "<unique line>" --text "..."`
      (or `--before` / `--at-line N`; the anchor must match exactly one line)
    - Replace: `latex-draft draft-replace --old "..." --new "..."`
-     (`--old` must occur exactly once)
+     (`--old` must occur exactly once outside draft blocks)
    - Delete: `latex-draft draft-delete --old "..."`
+   - Comment (Commenter mode, or to flag something in Writer mode):
+     `latex-draft draft-comment --after "<unique line>" --text "..."`
    - If the instruction is ambiguous (several options), draft **several
-     options** (e.g. two inserts, or two replaces with different `--new`);
-     the user picks one to accept and rejects the rest. (Writer mode: this is
-     the default, see above.)
-- In Commenter mode use `draft-comment` instead: attach a footnote at the
-  relevant anchor (`--after "<unique line>"`), e.g. "TODO: needs citation",
-  "This claim contradicts Section 2", "Consider splitting this paragraph".
+     options** (Writer mode: this is the default, see best practices).
 4. **Compile** (mandatory end of turn): `latex-draft compile`.
-   A PDF inspector/viewer shows the updated PDF automatically. Compiling
-   also ends the turn: it takes the per-turn backup and bumps the turn
-   counter, so `undo --turn` can revert everything you did this turn.
+   The PDF viewer shows the updated PDF automatically. Compiling also ends
+   the turn: it takes the per-turn backup and bumps the turn counter.
 5. **Report** draft ids and previews, and ask the user which to accept.
 
-## Resolving drafts (next turn, after the user looks at the PDF)
+Allowed in TURN: `draft-insert`, `draft-replace`, `draft-delete`,
+`draft-comment`, `compile`, plus read-only commands (`list`, `status`,
+`changelog`). **Never** `accept`, `reject`, or `undo` in TURN — resolving
+happens in RESOLVE.
 
-- `latex-draft list` — show pending/resolved drafts with previews.
-- `latex-draft accept --id <id>` or `--all` — merge into the `.tex` **without**
-  any `changes` markup or marker comments.
-- `latex-draft reject --id <id>` or `--all` — restore the original text.
-- End the turn with `latex-draft compile` again. (If the user asks to undo
-  something, use `latex-draft undo --n K` or `undo --turn`, then `compile`.)
+### State 3: REVIEW (the user looks at the PDF)
+
+The compiled PDF is open in front of the user. You do nothing; the user
+inspects the marked-up drafts. Your previous message already listed the
+draft ids. Wait for the user's verdict.
+
+### State 4: RESOLVE (the user decides on drafts)
+
+The user's message names which drafts to keep or discard. Execute:
+
+1. `latex-draft list` — confirm the current pending drafts and their ids.
+2. For each draft the user named:
+   - keep → `latex-draft accept --id <id>` (or `accept --all`)
+   - discard → `latex-draft reject --id <id>` (or `reject --all`)
+3. If the user asks to undo something instead: `latex-draft undo --n K` or
+   `latex-draft undo --turn`.
+4. **Compile** (mandatory end of turn): `latex-draft compile`.
+5. Report what was merged/restored and return to IDLE.
+
+Allowed in RESOLVE: `accept`, `reject`, `undo`, `compile`, `list`,
+`status`. **Never** `draft-*` in RESOLVE — if the user asks for a new change
+while resolving, finish the resolution first (steps 1–4), then start a new
+TURN for the new request.
+
+### Loop summary table
+
+| State | Trigger | Allowed tool commands | Forbidden |
+|---|---|---|---|
+| SESSION START | conversation begins | `status`, `backup` | everything else |
+| IDLE | user sends instruction | `status`, `list`, `changelog`, `backups` | `draft-*`, `accept`, `reject`, `undo`, `compile` |
+| TURN | specific editing request | `draft-*`, `compile`, read-only | `accept`, `reject`, `undo` |
+| REVIEW | PDF is open for inspection | none (wait) | everything |
+| RESOLVE | user decides on drafts | `accept`, `reject`, `undo`, `compile`, `list`, `status` | `draft-*` |
+
+Every turn — TURN or RESOLVE — **must end with exactly one `compile`**.
+A turn that drafted but did not compile is an error: fix it by compiling
+before doing anything else.
 
 ## Change log and undo
 
@@ -157,18 +225,12 @@ The user may edit the `.tex` file directly, even mid-turn:
   write; if the file changed while the change was being prepared, the write
   is **aborted** and the user's edit is never clobbered.
 
-## Session start
-
-At the beginning of a conversation (before the first edit), run
-`latex-draft <file.tex> status` — this takes the full initial backup on first
-use and confirms the document state. If the document has no state yet, also
-run `latex-draft <file.tex> backup --note "session start"` for an explicit,
-named restore point.
-
 ## Rules
 
 - One turn = user input → turn-start check → drafted change(s) via the
-  tool → `compile`.
+  tool → `compile`. Follow the state machine above: know your state
+  (IDLE / TURN / REVIEW / RESOLVE) before every tool call and only use the
+  commands that state allows.
 - Anchors (`--after`/`--before`/`--old`) must be unique in the file; if a
   match is not unique, re-read the file and use a longer anchor or
   `--at-line`.
