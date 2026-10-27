@@ -155,12 +155,14 @@ One user request = one turn. Execute in this order:
 4. **Compile** (mandatory end of turn): `latex-draft compile`.
    The PDF viewer shows the updated PDF automatically. Compiling also ends
    the turn: it takes the per-turn backup and bumps the turn counter.
+   **If the compile fails**, run `latex-draft repair` (see "Repair mode"
+   below), then compile again.
 5. **Report** draft ids and previews, and ask the user which to accept.
 
 Allowed in TURN: `draft-insert`, `draft-replace`, `draft-delete`,
-`draft-comment`, `compile`, plus read-only commands (`list`, `status`,
-`changelog`). **Never** `accept`, `reject`, or `undo` in TURN — resolving
-happens in RESOLVE.
+`draft-comment`, `compile`, `repair`, plus read-only commands (`list`,
+`status`, `changelog`). **Never** `accept`, `reject`, or `undo` in TURN —
+resolving happens in RESOLVE.
 
 ### State 3: REVIEW (the user looks at the PDF)
 
@@ -192,7 +194,7 @@ TURN for the new request.
 |---|---|---|---|
 | SESSION START | conversation begins | `status`, `backup` | everything else |
 | IDLE | user sends instruction | `status`, `list`, `changelog`, `backups` | `draft-*`, `accept`, `reject`, `undo`, `compile` |
-| TURN | specific editing request | `draft-*`, `compile`, read-only | `accept`, `reject`, `undo` |
+| TURN | specific editing request | `draft-*`, `compile`, `repair`, read-only | `accept`, `reject`, `undo` |
 | REVIEW | PDF is open for inspection | none (wait) | everything |
 | RESOLVE | user decides on drafts | `accept`, `reject`, `undo`, `compile`, `list`, `status` | `draft-*` |
 
@@ -216,6 +218,7 @@ a chapter (use `--file` for that).
 | `accept` | merge draft(s) into the file, removing markup | `--id <id>` or `--all` |
 | `reject` | discard draft(s), restoring original text | `--id <id>` or `--all` |
 | `compile` | recompile the PDF; ends the turn (per-turn backup) | — |
+| `repair` | after a failed compile: analyze the log, apply safe fixes as drafts, suggest the rest | — |
 | `backup` | take a manual snapshot | `--note "..."` |
 | `undo` | revert recorded changes | `--n K` or `--turn` |
 | `backups` | list snapshots | — |
@@ -224,6 +227,25 @@ a chapter (use `--file` for that).
 
 Exit codes: `0` success, `1` nothing to do / runtime failure, `2` usage error
 (unknown draft id, ambiguous anchor, text not found, file not an input).
+
+## Repair mode (when `compile` fails)
+
+`latex-draft <file> repair` analyzes the last `.log` and:
+
+- **Auto-fixes safely**, as normal *drafted* changes (marked with the
+  `changes` package, backed up, changelogged, reviewable in the PDF — nothing
+  is applied silently):
+  - `\begin{X} ended by \end{Y}` — corrects the wrong `\end{Y}` to `\end{X}`
+    (located in the main file or any `\input`/`\include` file).
+  - undefined `\added`/`\deleted`/`\footnote` with no `changes` package —
+    injects the preamble into the main file.
+- **Prints `SUGGESTION`s** for everything else — undefined control
+  sequences (typo? missing `\usepackage`?), undefined environments, missing
+  files, runaway arguments (unbalanced braces) — with the log line number.
+- Recompiles afterwards and reports whether the document builds again.
+
+After `repair`, treat its fixes like any other drafts: `list`, review in the
+PDF, `accept`/`reject`, then `compile`.
 
 ## Change log and undo
 

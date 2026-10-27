@@ -684,6 +684,83 @@ class TestCompileAndStatus(LatexDraftCase):
         self.assertEqual(self.run_cli("list"), 0)
 
 
+SAMPLE_LOG = """This is pdfTeX, Version 3.14159265
+\\openout1 = `paper.log'.
+(./paper.tex
+! Undefined control sequence.
+l.6 \\badcommand
+                  {x}
+! LaTeX Error: Environment figuree undefined.
+! LaTeX Error: File `missing-fig.pdf' not found.
+! LaTeX Error: \\begin{document} ended by \\end{documnt}.
+! Emergency stop.
+"""
+
+MISMATCH_LOG = """This is pdfTeX
+! LaTeX Error: \\begin{document} ended by \\end{documnt}.
+! Emergency stop.
+"""
+
+
+class TestRepair(LatexDraftCase):
+    def write_log(self, content):
+        (self.dir / (self.tex.stem + ".log")).write_text(content)
+
+    def test_analyze_log_extracts_known_errors(self):
+        from tools.latex_draft import analyze_log
+
+        self.write_log(SAMPLE_LOG)
+        problems = analyze_log(self.tex)
+        kinds = [p["kind"] for p in problems]
+        self.assertIn("undefined-control", kinds)
+        self.assertIn("undefined-environment", kinds)
+        self.assertIn("missing-file", kinds)
+        self.assertIn("begin-end-mismatch", kinds)
+        uc = next(p for p in problems if p["kind"] == "undefined-control")
+        self.assertEqual(uc["line"], 6)
+
+    def test_analyze_log_empty_when_no_log(self):
+        from tools.latex_draft import analyze_log
+
+        self.assertEqual(analyze_log(self.tex), [])
+
+    def test_repair_fixes_begin_end_mismatch_as_draft(self):
+        self.tex.write_text(PAPER.replace("\\end{document}", "\\end{documnt}"))
+        self.write_log(MISMATCH_LOG)
+        # no LaTeX engine here, so run_latex inside repair returns 0
+        rc = self.run_cli("repair")
+        self.assertEqual(rc, 0)
+        # the fix is a normal drafted change: marked, pending, reversible
+        text = self.tex.read_text()
+        self.assertIn("latex-draft:", text)
+        did = self.draft_ids()[0]
+        self.assertEqual(self.state()["drafts"][did]["op"], "replace")
+        self.run_cli("accept", "--id", did)
+        self.assertIn("\\end{document}", self.tex.read_text())
+        self.assertNotIn("documnt", self.tex.read_text())
+
+    def test_repair_suggests_for_unfixable_errors(self):
+        self.write_log(SAMPLE_LOG)
+        rc = self.run_cli("repair")
+        # undefined-control of an unknown command is not auto-fixed
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.draft_ids(), [])
+
+    def test_repair_compiles_clean_says_nothing_to_do(self):
+        # no log + no engine -> run_latex returns 0 -> "nothing to repair"
+        rc = self.run_cli("repair")
+        self.assertEqual(rc, 0)
+
+    def test_repair_records_changes_in_changelog(self):
+        from tools.latex_draft import read_changelog
+
+        self.tex.write_text(PAPER.replace("\\end{document}", "\\end{documnt}"))
+        self.write_log(MISMATCH_LOG)
+        self.run_cli("repair")
+        entries = [e for e in read_changelog(self.tex) if e["kind"] == "change"]
+        self.assertTrue(any("repair" in e["note"] for e in entries))
+
+
 class TestPrune(LatexDraftCase):
     def test_prune_retention(self):
         from tools.latex_draft import backups_dir, prune

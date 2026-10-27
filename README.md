@@ -74,6 +74,13 @@ Requires Python 3.10+ (standard library only). Compiling requires
 `latexmk` or `pdflatex` with the `changes` package; without a LaTeX engine
 the tool still drafts/backs up and skips compilation with a warning.
 
+**Repair mode**: when `compile` fails, `latex-draft <file> repair` analyzes
+the `.log`, auto-fixes what is safe (a wrong `\end{...}` from a
+`\begin{...}/\end{...}` mismatch; a missing `changes` preamble) as normal
+*drafted* changes you review in the PDF, and prints suggestions for
+everything else (undefined commands/environments, missing files, unbalanced
+braces). See `SKILL.md` → "Repair mode".
+
 ## Command reference
 
 All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
@@ -88,6 +95,7 @@ All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
 | `accept` | merge draft(s) into the file, removing markup | `--id <id>` or `--all` |
 | `reject` | discard draft(s), restoring original text | `--id <id>` or `--all` |
 | `compile` | recompile the PDF; ends the turn (per-turn backup) | — |
+| `repair` | after a failed compile: analyze the log, apply safe fixes as drafts, suggest the rest | — |
 | `backup` | take a manual snapshot | `--note "..."` |
 | `undo` | revert recorded changes | `--n K` or `--turn` |
 | `backups` | list snapshots | — |

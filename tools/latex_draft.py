@@ -864,12 +864,8 @@ def cmd_reject(tex: Path, state: dict, args: argparse.Namespace) -> int:
     return _resolve(tex, state, args, accept=False)
 
 
-def cmd_compile(tex: Path, state: dict, args: argparse.Namespace) -> int:
-    # End of turn: take the per-turn backup and advance the turn counter.
-    snapshot(tex, f"end of turn {state.get('turn', 0) + 1}")
-    state["turn"] = state.get("turn", 0) + 1
-    state["file_hashes"] = current_hashes(tex)
-    save_state(tex, state)
+def run_latex(tex: Path) -> tuple[int, str]:
+    """Compile the document. Returns (exit_code, log_tail)."""
     latexmk = shutil.which("latexmk")
     pdflatex = shutil.which("pdflatex")
     if latexmk:
@@ -879,29 +875,255 @@ def cmd_compile(tex: Path, state: dict, args: argparse.Namespace) -> int:
         cmd = [pdflatex, "-interaction=nonstopmode", tex.name]
         runs = 2
     else:
+        return 0, ""
+    proc = None
+    for _ in range(runs):
+        proc = subprocess.run(cmd, cwd=tex.parent, capture_output=True, text=True)
+    log = tex.parent / (tex.stem + ".log")
+    tail = ""
+    if log.exists():
+        tail = "\n".join(log.read_text(errors="replace").splitlines()[-30:])
+    return (proc.returncode if proc else 1), tail
+
+
+def cmd_compile(tex: Path, state: dict, args: argparse.Namespace) -> int:
+    # End of turn: take the per-turn backup and advance the turn counter.
+    snapshot(tex, f"end of turn {state.get('turn', 0) + 1}")
+    state["turn"] = state.get("turn", 0) + 1
+    state["file_hashes"] = current_hashes(tex)
+    save_state(tex, state)
+    if not (shutil.which("latexmk") or shutil.which("pdflatex")):
         print(
             "latex-draft: no LaTeX engine found (latexmk/pdflatex); "
             "skipping compile",
             file=sys.stderr,
         )
         return 0
-    proc = None
-    for _ in range(runs):
-        proc = subprocess.run(cmd, cwd=tex.parent, capture_output=True, text=True)
-    if proc is not None and proc.returncode != 0:
-        log = tex.parent / (tex.stem + ".log")
+    code, tail = run_latex(tex)
+    if code != 0:
         print(
-            f"latex-draft: compile failed (exit {proc.returncode}); "
-            f"last log lines from {log.name}:",
+            f"latex-draft: compile failed (exit {code}); "
+            f"last log lines from {tex.stem}.log:",
             file=sys.stderr,
         )
-        if log.exists():
-            tail = log.read_text(errors="replace").splitlines()[-30:]
-            print("\n".join(tail), file=sys.stderr)
+        print(tail, file=sys.stderr)
+        print(
+            "latex-draft: run `repair` to analyze the errors and fix them",
+            file=sys.stderr,
+        )
         return 1
     pdf = tex.parent / (tex.stem + ".pdf")
     print(f"latex-draft: compiled {pdf.name}")
     return 0
+
+
+# ---------------------------------------------------------------- repair
+
+UNDEFINED_CONTROL_RE = re.compile(
+    r"! Undefined control sequence\.\s*\n?l\.(\d+)\s*(\\?[a-zA-Z@]+)"
+)
+UNDEFINED_ENV_RE = re.compile(r"! LaTeX Error: Environment (\S+) undefined\.")
+MISSING_FILE_RE = re.compile(r"! LaTeX Error: File `([^']+)' not found\.")
+MISSING_BEGEND_RE = re.compile(r"! LaTeX Error: \\begin\{([^}]+)\} ended by \\end\{([^}]+)\}\.")
+RUNAWAY_RE = re.compile(r"! File ended while scanning use of \\([a-zA-Z]+)\.")
+EMERGENCY_STOP_RE = re.compile(r"! Emergency stop\.")
+
+
+def analyze_log(tex: Path) -> list[dict]:
+    """Extract actionable errors from the LaTeX log."""
+    log = tex.parent / (tex.stem + ".log")
+    if not log.exists():
+        return []
+    text = log.read_text(errors="replace")
+    problems: list[dict] = []
+    for m in UNDEFINED_CONTROL_RE.finditer(text):
+        command = (m.group(2) or "").lstrip("\\")
+        problems.append({
+            "kind": "undefined-control",
+            "command": command,
+            "line": int(m.group(1)),
+            "detail": m.group(0).splitlines()[0],
+        })
+    for m in UNDEFINED_ENV_RE.finditer(text):
+        problems.append({
+            "kind": "undefined-environment",
+            "environment": m.group(1),
+            "detail": m.group(0).splitlines()[0],
+        })
+    for m in MISSING_FILE_RE.finditer(text):
+        problems.append({
+            "kind": "missing-file",
+            "file": m.group(1),
+            "detail": m.group(0).splitlines()[0],
+        })
+    for m in MISSING_BEGEND_RE.finditer(text):
+        problems.append({
+            "kind": "begin-end-mismatch",
+            "begin": m.group(1),
+            "end": m.group(2),
+            "detail": m.group(0).splitlines()[0],
+        })
+    for m in RUNAWAY_RE.finditer(text):
+        problems.append({
+            "kind": "runaway-argument",
+            "command": m.group(1),
+            "detail": m.group(0).splitlines()[0],
+        })
+    if EMERGENCY_STOP_RE.search(text) and not problems:
+        problems.append({"kind": "emergency-stop", "detail": "! Emergency stop."})
+    return problems
+
+
+def find_line_in_files(tex: Path, needle: str) -> tuple[Path, int] | None:
+    """Find the first file (main or input) containing `needle`; returns
+    (file, 1-based line number)."""
+    for f in watched_files(tex):
+        try:
+            lines = f.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for i, line in enumerate(lines, start=1):
+            if needle in line:
+                return f, i
+    return None
+
+
+def cmd_repair(tex: Path, state: dict, args: argparse.Namespace) -> int:
+    r"""Repair mode: analyze the last failed compile and fix what can be
+    fixed safely.
+
+    Repairs are applied as normal drafted changes (marked, backed up,
+    changelogged) so the user reviews them in the PDF. Only safe, mechanical
+    fixes are attempted:
+    - an \end{X} closed by \begin{Y} (or vice versa) -> correct the \end.
+    - undefined control sequence from a draft block (the changes package is
+      missing) -> ensure the changes preamble in the main file.
+    Everything else is reported as a suggestion for the agent/user.
+    """
+    problems = analyze_log(tex)
+    if not problems:
+        code, tail = run_latex(tex)
+        if code == 0:
+            print(f"latex-draft: nothing to repair; {tex.stem}.pdf compiles")
+            return 0
+        problems = analyze_log(tex)
+        if not problems:
+            print(
+                "latex-draft: compile failed but no known error pattern was "
+                f"found in {tex.stem}.log; last log lines:",
+                file=sys.stderr,
+            )
+            print(tail, file=sys.stderr)
+            return 1
+    print(f"latex-draft: found {len(problems)} problem(s) in {tex.stem}.log:")
+    for p in problems:
+        print(f"  - [{p['kind']}] {p['detail']}")
+    fixed = 0
+    suggestions: list[str] = []
+    for p in problems:
+        if p["kind"] == "begin-end-mismatch":
+            # TeX reports "\begin{X} ended by \end{Y}": the \end is wrong,
+            # but a document may contain several \end{Y}; fix the one whose
+            # line number is closest to (and not before) the position TeX
+            # stopped at, preferring the last unmatched \begin{X}.
+            begin_hits = [
+                (f, i)
+                for f in watched_files(tex)
+                for i, line in enumerate(
+                    f.read_text(encoding="utf-8", errors="replace").splitlines(),
+                    start=1,
+                )
+                if rf"\begin{{{p['begin']}}}" in line
+            ]
+            end_hits = [
+                (f, i)
+                for f in watched_files(tex)
+                for i, line in enumerate(
+                    f.read_text(encoding="utf-8", errors="replace").splitlines(),
+                    start=1,
+                )
+                if rf"\end{{{p['end']}}}" in line
+            ]
+            if begin_hits and end_hits:
+                # pair them up in order; the mismatch is the first unpaired \end
+                target, lineno = end_hits[len(begin_hits) - 1] if len(end_hits) >= len(begin_hits) else end_hits[-1]
+                did = new_id(state)
+                wrong = rf"\end{{{p['end']}}}"
+                right = rf"\end{{{p['begin']}}}"
+                mutate(
+                    tex,
+                    state,
+                    f"repair: \\end{{{p['end']}}} -> \\end{{{p['begin']}}} "
+                    f"in {target.name}:{lineno}",
+                    lambda text: text.replace(
+                        wrong, build_block(did, old=wrong, new=right), 1
+                    ),
+                    target=target,
+                )
+                state["drafts"][did] = draft_record(did, "replace", right)
+                state["drafts"][did]["file"] = target.name
+                state["drafts"][did]["repair"] = True
+                save_state(tex, state)
+                fixed += 1
+                continue
+            suggestions.append(f"fix the mismatched \\end{{{p['end']}}} by hand")
+        elif p["kind"] == "undefined-control" and p.get("command") in (
+            "added", "deleted", "footnote",
+        ):
+            text = tex.read_text(encoding="utf-8")
+            if "changes" not in text:
+                mutate(
+                    tex,
+                    state,
+                    "repair: inject changes package preamble",
+                    ensure_changes_package,
+                )
+                fixed += 1
+                continue
+            suggestions.append(
+                f"\\{p['command']} is undefined but the changes package is "
+                "loaded; check the preamble by hand"
+            )
+        elif p["kind"] == "undefined-control":
+            suggestions.append(
+                f"undefined \\{p.get('command', '?')} (log line {p.get('line', '?')}): "
+                "check for a typo or a missing \\usepackage"
+            )
+        elif p["kind"] == "undefined-environment":
+            suggestions.append(
+                f"undefined environment '{p['environment']}': check for a typo "
+                "or a missing \\usepackage / \\newenvironment"
+            )
+        elif p["kind"] == "missing-file":
+            suggestions.append(
+                f"missing file '{p['file']}': create it, fix the path, or "
+                "remove the \\input/\\include"
+            )
+        elif p["kind"] == "runaway-argument":
+            suggestions.append(
+                f"runaway argument of \\{p['command']}: an opening brace is "
+                "missing its closing brace"
+            )
+        else:
+            suggestions.append(p["detail"])
+    for s in suggestions:
+        print(f"latex-draft: SUGGESTION: {s}")
+    if fixed:
+        code, tail = run_latex(tex)
+        if code == 0:
+            pdf = tex.parent / (tex.stem + ".pdf")
+            print(f"latex-draft: repair applied; compiled {pdf.name}")
+            return 0
+        print(
+            f"latex-draft: repair applied but compile still fails; "
+            f"remaining problems:",
+            file=sys.stderr,
+        )
+        for p in analyze_log(tex):
+            print(f"  - [{p['kind']}] {p['detail']}", file=sys.stderr)
+        return 1
+    print("latex-draft: no automatic repair available; see suggestions above")
+    return 1
 
 
 def cmd_backup(tex: Path, state: dict, args: argparse.Namespace) -> int:
@@ -1048,6 +1270,7 @@ HANDLERS = {
     "accept": cmd_accept,
     "reject": cmd_reject,
     "compile": cmd_compile,
+    "repair": cmd_repair,
     "backup": cmd_backup,
     "undo": cmd_undo,
     "backups": cmd_backups,
@@ -1116,6 +1339,12 @@ def build_parser() -> argparse.ArgumentParser:
         g.add_argument("--all", action="store_true", help="all pending drafts")
 
     sub.add_parser("compile", help="recompile the PDF (end every turn with this)")
+
+    sub.add_parser(
+        "repair",
+        help="after a failed compile: analyze the log, apply safe fixes as "
+        "drafted changes, and report suggestions for the rest",
+    )
 
     p = sub.add_parser("backup", help="take a manual backup snapshot")
     p.add_argument("--note", default="", help="note stored with the snapshot")
