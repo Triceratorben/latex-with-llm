@@ -449,3 +449,30 @@ Before closing a session, finish with a **reference check**:
 - Keep drafted LaTeX idiomatic; escape `%`, `&`, `#`, `_` etc. as needed.
 - Do not commit backups, state files, changelogs, or build artifacts (see
   `.gitignore`).
+
+## Reducing approval prompts (Mistral Vibe)
+
+This skill's only side-effecting mechanism is one shell command,
+`python3 tools/latex_draft.py <main.tex> <command>`. If you run Vibe's
+`smart-approve` agent, every such call may trigger an approval prompt.
+The user can clear them by allowlisting the command in Vibe's
+configuration (`~/.vibe/config.toml` or a trusted project's
+`./.vibe/config.toml`):
+
+```toml
+[tools.bash]
+permission = "ask"
+allowlist = [
+  "python3 tools/latex_draft.py *",
+  "python3 */tools/latex_draft.py *",
+  "latex-draft *",
+  "latexmk *",
+  "pdflatex *",
+]
+```
+
+Allowlisted commands skip the prompt even under `smart-approve`
+(permission rules are applied before the classifier). The `allowed-tools`
+field in a skill's `SKILL.md` frontmatter does **not** grant auto-approval —
+the bash allowlist is the mechanism. See `README.md` → "Reducing approval
+prompts in Mistral Vibe" for the full snippet.

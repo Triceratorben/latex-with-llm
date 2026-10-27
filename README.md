@@ -139,3 +139,42 @@ Exit codes: `0` success, `1` nothing to do / runtime failure / check failed,
 not an input).
 See `SKILL.md` for the full guide: modes, the conversation state machine,
 and the per-state command rules.
+
+## Reducing approval prompts in Mistral Vibe
+
+This skill runs entirely through one shell command —
+`python3 tools/latex_draft.py <main.tex> <command>` — plus `compile`, which
+runs `latexmk`/`pdflatex` itself. Under Vibe's `smart-approve` agent every
+tool call can still trigger an approval prompt. To clear the skill's
+commands for automatic use, allowlist them in your Vibe configuration
+(`~/.vibe/config.toml`, or `./.vibe/config.toml` in a trusted project):
+
+```toml
+[tools.bash]
+permission = "ask"
+allowlist = [
+  "python3 tools/latex_draft.py *",
+  "python3 */tools/latex_draft.py *",
+  "latex-draft *",
+  "latexmk *",
+  "pdflatex *",
+  "pdftotext *",
+  "grep *",
+  "cat *",
+  "ls *",
+  "git status",
+  "git diff *",
+  "git log *",
+]
+```
+
+Allowlisted commands run without a prompt even under `smart-approve` — the
+permission rules are applied before the classifier. Adjust the path patterns
+to where you installed the skill (e.g. `~/.vibe/skills/latex-with-llm`).
+Alternatives: run Vibe with `--agent auto-approve` (approves *everything* —
+use only in a sandbox), or press `2` at an approval prompt to allow a command
+for the rest of the session.
+
+Note: the `allowed-tools` field in a skill's `SKILL.md` frontmatter is read
+by Vibe but **not enforced** — it does not grant auto-approval. The bash
+allowlist above is the mechanism that skips the prompts.
