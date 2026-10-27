@@ -47,6 +47,17 @@ comments. The document preamble is auto-augmented with
 `\usepackage[draft]{changes}`, so recompiling shows additions in green and
 deletions struck through — the user inspects the PDF and decides.
 
+**Multi-file documents.** If the paper is stitched together from several
+files (`\input`/`\include` in the main file), pass `--file <name.tex>` to any
+`draft-*` command to draft directly into that part (e.g.
+`draft-insert --file chapter1.tex --after "..." --text "..."`). The file
+must be one of the main file's `\input`/`\include` dependencies. Anchors are
+searched only within the target file, the `changes` package is only injected
+into the main file, and the changelog records which file each change
+touched. Everything else — accept/reject, undo, backups, hand-edit detection
+— works across all files of the document automatically. (`status` lists the
+detected input files.)
+
 ## Clarify before acting (vague instructions)
 
 **Do not carry out a turn — do not call any mutating tool command and do not
@@ -130,12 +141,15 @@ One user request = one turn. Execute in this order:
    directly. (Mode rules apply: Writer may draft anything, Commenter only
    `draft-comment`.)
    - Insert: `latex-draft draft-insert --after "<unique line>" --text "..."`
-     (or `--before` / `--at-line N`; the anchor must match exactly one line)
+     (or `--before` / `--at-line N`; the anchor must match exactly one line
+     in the target file)
    - Replace: `latex-draft draft-replace --old "..." --new "..."`
      (`--old` must occur exactly once outside draft blocks)
    - Delete: `latex-draft draft-delete --old "..."`
    - Comment (Commenter mode, or to flag something in Writer mode):
      `latex-draft draft-comment --after "<unique line>" --text "..."`
+   - All four accept `--file <name.tex>` to edit an `\input`/`\include`
+     part of a multi-file document instead of the main file.
    - If the instruction is ambiguous (several options), draft **several
      options** (Writer mode: this is the default, see best practices).
 4. **Compile** (mandatory end of turn): `latex-draft compile`.

@@ -579,32 +579,33 @@ def draft_record(did: str, op: str, preview_text: str) -> dict:
     }
 
 
-def mutate(tex: Path, state: dict, note: str, fn) -> Path:
-    """Apply fn to the document: snapshot, changelog, verify, write.
+def mutate(tex: Path, state: dict, note: str, fn, target: Path | None = None) -> Path:
+    """Apply fn to a file of the document: snapshot, changelog, verify, write.
 
-    The hash re-check immediately before the write guards against the user
-    editing the file while this change was being prepared (mid-turn race).
+    `target` is the file being edited (defaults to the main file `tex`).
+    The changelog always belongs to the main file. The hash re-check
+    immediately before the write guards against the user editing any file of
+    the document while this change was being prepared (mid-turn race).
     """
-    before_text = tex.read_text(encoding="utf-8")
+    target = target or tex
+    before_text = target.read_text(encoding="utf-8")
     snap = snapshot(tex, note)
     new_text = fn(before_text)
-    lines = new_text.split("\n")
-    if lines and lines[0] in (CHANGES_PACKAGE, CHANGES_AUTHOR):
-        raise DraftError("insertion landed before \\documentclass")
     assert_no_external_change(tex, state)
     entry = {
         "kind": "change",
         "note": note,
         "turn": state.get("turn", 0),
         "backup": snap.name,
+        "file": target.name,
         "before_sha256": sha256(before_text),
         "after_sha256": sha256(new_text),
         "before": before_text,
         "after": new_text,
     }
-    tmp = tex.with_suffix(tex.suffix + ".tmp")
+    tmp = target.with_suffix(target.suffix + ".tmp")
     tmp.write_text(new_text, encoding="utf-8")
-    os.replace(tmp, tex)
+    os.replace(tmp, target)
     append_changelog(tex, entry)
     state["file_hashes"] = current_hashes(tex)
     return snap
@@ -615,8 +616,19 @@ def mutate(tex: Path, state: dict, note: str, fn) -> Path:
 
 def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
     did = new_id(state)
+    target = resolve_target(tex, getattr(args, "file", None))
+    if target is None:
+        return 2
 
     def fn(text: str) -> str:
+        if target != tex:
+            return insert_block(
+                text,
+                build_block(did, new=args.text),
+                after=args.after,
+                before=args.before,
+                at_line=args.at_line,
+            )
         text = ensure_changes_package(text)
         return insert_block(
             text,
@@ -627,24 +639,55 @@ def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
         )
 
     try:
-        mutate(tex, state, f"draft insert {did}", fn)
+        mutate(tex, state, f"draft insert {did}", fn, target=target)
     except DraftError as e:
         print(f"latex-draft: {e}", file=sys.stderr)
         return 2
     state["drafts"][did] = draft_record(did, "insert", args.text)
+    state["drafts"][did]["file"] = target.name
     save_state(tex, state)
-    print(f"latex-draft: drafted insert {did} in {tex.name}")
+    print(f"latex-draft: drafted insert {did} in {target.name}")
     return 0
+
+
+def resolve_target(tex: Path, file_arg: str | None) -> Path | None:
+    """Resolve the --file option to an editable file of the document.
+
+    Without --file the main file is edited. With --file, the file must be
+    one of the main file's \\input/\\include dependencies (so anchors and
+    uniqueness checks stay within a real part of the document).
+    """
+    if not file_arg:
+        return tex
+    candidate = (tex.parent / file_arg).resolve()
+    if not candidate.is_file():
+        print(f"latex-draft: no such file: {candidate}", file=sys.stderr)
+        return None
+    if candidate == tex:
+        return tex
+    deps = {d.resolve() for d in tex_inputs(tex)}
+    if candidate not in deps:
+        print(
+            f"latex-draft: {file_arg} is not the main file and not one of its "
+            f"\\input/\\include dependencies ({', '.join(sorted(d.name for d in tex_inputs(tex))) or 'none'})",
+            file=sys.stderr,
+        )
+        return None
+    return candidate
 
 
 def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str) -> int:
     did = new_id(state)
     old = args.old
     new = getattr(args, "new", None)
-    text = tex.read_text(encoding="utf-8")
+    target = resolve_target(tex, getattr(args, "file", None))
+    if target is None:
+        return 2
+    text = target.read_text(encoding="utf-8")
 
     def fn(text: str) -> str:
-        text = ensure_changes_package(text)
+        if target == tex:
+            text = ensure_changes_package(text)
         # Draft over the visible occurrence of the old text. If a pending
         # draft already replaced it, the visible text no longer contains it;
         # draft over the original inside the outermost pending draft block.
@@ -681,14 +724,15 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
         return 2
 
     try:
-        mutate(tex, state, f"draft {op} {did}", fn)
+        mutate(tex, state, f"draft {op} {did}", fn, target=target)
     except DraftError as e:
         print(f"latex-draft: {e}", file=sys.stderr)
         return 2
     preview = new if op == "replace" else old
     state["drafts"][did] = draft_record(did, op, preview)
+    state["drafts"][did]["file"] = target.name
     save_state(tex, state)
-    print(f"latex-draft: drafted {op} {did} in {tex.name}")
+    print(f"latex-draft: drafted {op} {did} in {target.name}")
     return 0
 
 
@@ -702,9 +746,13 @@ def cmd_draft_delete(tex: Path, state: dict, args: argparse.Namespace) -> int:
 
 def cmd_draft_comment(tex: Path, state: dict, args: argparse.Namespace) -> int:
     did = new_id(state)
+    target = resolve_target(tex, getattr(args, "file", None))
+    if target is None:
+        return 2
 
     def fn(text: str) -> str:
-        text = ensure_changes_package(text)
+        if target == tex:
+            text = ensure_changes_package(text)
         return insert_block(
             text,
             build_comment_block(did, args.text),
@@ -714,13 +762,14 @@ def cmd_draft_comment(tex: Path, state: dict, args: argparse.Namespace) -> int:
         )
 
     try:
-        mutate(tex, state, f"draft comment {did}", fn)
+        mutate(tex, state, f"draft comment {did}", fn, target=target)
     except DraftError as e:
         print(f"latex-draft: {e}", file=sys.stderr)
         return 2
     state["drafts"][did] = draft_record(did, "comment", args.text)
+    state["drafts"][did]["file"] = target.name
     save_state(tex, state)
-    print(f"latex-draft: drafted comment {did} in {tex.name}")
+    print(f"latex-draft: drafted comment {did} in {target.name}")
     return 0
 
 
@@ -758,20 +807,33 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
                 )
                 return 2
 
-    def fn(text: str) -> str:
-        new_text, found = resolve_drafts(text, set(ids), accept)
-        missing = set(ids) - found
-        if missing:
-            raise DraftError(
-                "draft(s) not found in document: " + ", ".join(sorted(missing))
-            )
-        return strip_changes_package_if_unused(new_text)
+    # Drafts may live in different files of the document; resolve each group
+    # in its own file. The changes package is only auto-injected into (and
+    # stripped from) the main file.
+    by_file: dict[str, list[str]] = {}
+    for did in ids:
+        fname = state["drafts"][did].get("file", tex.name)
+        by_file.setdefault(fname, []).append(did)
 
-    try:
-        mutate(tex, state, f"{verb} {','.join(ids)}", fn)
-    except DraftError as e:
-        print(f"latex-draft: {e}", file=sys.stderr)
-        return 2
+    for fname, file_ids in by_file.items():
+        target = tex if fname == tex.name else tex.parent / fname
+
+        def fn(text: str, file_ids=file_ids) -> str:
+            new_text, found = resolve_drafts(text, set(file_ids), accept)
+            missing = set(file_ids) - found
+            if missing:
+                raise DraftError(
+                    f"draft(s) not found in {fname}: " + ", ".join(sorted(missing))
+                )
+            if target == tex:
+                return strip_changes_package_if_unused(new_text)
+            return new_text
+
+        try:
+            mutate(tex, state, f"{verb} {','.join(file_ids)}", fn, target=target)
+        except DraftError as e:
+            print(f"latex-draft: {e}", file=sys.stderr)
+            return 2
     # A draft whose block was consumed by resolving an overlapping draft is
     # resolved as well: its text is already gone (reject) or merged (accept).
     if accept:
@@ -894,17 +956,19 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
         n = max(1, min(args.n, len(entries)))
         targets = entries[-n:]
     for entry in reversed(targets):
-        current = tex.read_text(encoding="utf-8")
+        fname = entry.get("file", tex.name)
+        target = tex if fname == tex.name else tex.parent / fname
+        current = target.read_text(encoding="utf-8")
         if sha256(current) != entry.get("after_sha256"):
             print(
-                f"latex-draft: WARNING: {tex.name} no longer matches the "
+                f"latex-draft: WARNING: {fname} no longer matches the "
                 f"state after '{entry.get('note', '?')}' (hand edits?); "
                 "restoring recorded content anyway",
                 file=sys.stderr,
             )
-        tmp = tex.with_suffix(tex.suffix + ".tmp")
+        tmp = target.with_suffix(target.suffix + ".tmp")
         tmp.write_text(entry["before"], encoding="utf-8")
-        os.replace(tmp, tex)
+        os.replace(tmp, target)
         append_changelog(
             tex,
             {
@@ -912,6 +976,7 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
                 "note": f"undo: {entry.get('note', '?')}",
                 "turn": state.get("turn", 0),
                 "undid_backup": entry.get("backup", ""),
+                "file": fname,
                 "before_sha256": entry.get("after_sha256", ""),
                 "after_sha256": entry.get("before_sha256", ""),
             },
@@ -919,7 +984,8 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
     state["file_hashes"] = current_hashes(tex)
     save_state(tex, state)
     what = f"turn {state.get('turn', 0)}" if args.turn else f"{n} change(s)"
-    print(f"latex-draft: undid {what}; {tex.name} restored")
+    files = sorted({e.get("file", tex.name) for e in targets})
+    print(f"latex-draft: undid {what}; restored {', '.join(files)}")
     return 0
 
 
@@ -932,7 +998,9 @@ def cmd_changelog(tex: Path, state: dict, args: argparse.Namespace) -> int:
     for i, e in enumerate(entries[start:], start=start + 1):
         note = e.get("note", "?")
         turn = e.get("turn", 0)
-        print(f"{i:>4}  turn {turn:<3} {e.get('kind', '?'):<7} {note}")
+        fname = e.get("file", "")
+        where = f"  [{fname}]" if fname and fname != tex.name else ""
+        print(f"{i:>4}  turn {turn:<3} {e.get('kind', '?'):<7} {note}{where}")
     return 0
 
 
@@ -956,6 +1024,9 @@ def cmd_status(tex: Path, state: dict, args: argparse.Namespace) -> int:
     changes = len([e for e in read_changelog(tex) if e.get("kind") == "change"])
     pdf = tex.parent / (tex.stem + ".pdf")
     print(f"file:    {tex}")
+    inputs = tex_inputs(tex)
+    if inputs:
+        print(f"inputs:  {', '.join(d.name for d in inputs)}")
     print(f"turn:    {state.get('turn', 0)}")
     print(f"drafts:  {len(drafts)} total, {pending} pending")
     print(f"changes: {changes} recorded in changelog")
@@ -993,8 +1064,16 @@ def build_parser() -> argparse.ArgumentParser:
         prog="latex-draft",
         description="Turn-based, draft-marked editing of LaTeX documents.",
     )
-    parser.add_argument("tex", type=Path, help="path to the .tex file")
+    parser.add_argument("tex", type=Path, help="path to the main .tex file")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_file_option(p, parser):
+        parser.add_argument(
+            "--file",
+            default=None,
+            help="edit this \\input/\\include file of the document instead of "
+            "the main file (path relative to the main file)",
+        )
 
     p = sub.add_parser("draft-insert", help="insert a drafted text at an anchor")
     g = p.add_mutually_exclusive_group(required=True)
@@ -1002,13 +1081,16 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--before", help="unique line content to insert before")
     g.add_argument("--at-line", type=int, help="1-based line number to insert before")
     p.add_argument("--text", required=True, help="LaTeX text to insert (drafted)")
+    add_file_option(p, p)
 
     p = sub.add_parser("draft-replace", help="draft replacing existing text")
     p.add_argument("--old", required=True, help="text to replace (must occur exactly once)")
     p.add_argument("--new", required=True, help="replacement LaTeX text")
+    add_file_option(p, p)
 
     p = sub.add_parser("draft-delete", help="draft deleting existing text")
     p.add_argument("--old", required=True, help="text to delete (must occur exactly once)")
+    add_file_option(p, p)
 
     p = sub.add_parser(
         "draft-comment",
@@ -1020,6 +1102,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--before", help="unique line content to attach the comment to")
     g.add_argument("--at-line", type=int, help="1-based line number to attach to")
     p.add_argument("--text", required=True, help="LaTeX comment text")
+    add_file_option(p, p)
 
     sub.add_parser("list", help="list drafts and their status")
 

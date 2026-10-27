@@ -456,6 +456,219 @@ class TestExternalEdits(LatexDraftCase):
         self.assertIn("chapter1.tex", warning)
 
 
+class TestMultiFile(LatexDraftCase):
+    """Multi-file documents: paper.tex stitched together from chapters."""
+
+    def setUp(self):
+        super().setUp()
+        self.chapter = self.dir / "chapter1.tex"
+        self.chapter.write_text("\\section{One}\nChapter body text.\n")
+        self.tex.write_text(
+            PAPER.replace(
+                "\\end{document}", "\\input{chapter1}\n\\end{document}"
+            )
+        )
+
+    def run_cli(self, *argv):
+        return main([str(self.tex), *argv])
+
+    def test_status_lists_inputs(self):
+        self.run_cli("status")
+        # smoke: no crash, chapter is an input
+        from tools.latex_draft import tex_inputs
+
+        self.assertEqual([d.name for d in tex_inputs(self.tex)], ["chapter1.tex"])
+
+    def test_draft_insert_into_chapter(self):
+        rc = self.run_cli(
+            "draft-insert",
+            "--file",
+            "chapter1.tex",
+            "--after",
+            "Chapter body text.",
+            "--text",
+            "Drafted chapter sentence.",
+        )
+        self.assertEqual(rc, 0)
+        chapter = self.chapter.read_text()
+        main_tex = self.tex.read_text()
+        did = self.draft_ids()[0]
+        self.assertIn(f"% latex-draft:{did}", chapter)
+        self.assertIn(r"\added[author=LLM]{Drafted chapter sentence.}", chapter)
+        # the main file is untouched and gets no changes preamble
+        self.assertNotIn("latex-draft:", main_tex)
+        self.assertNotIn("usepackage[draft]{changes}", main_tex)
+        self.assertEqual(self.state()["drafts"][did]["file"], "chapter1.tex")
+
+    def test_draft_replace_in_chapter(self):
+        rc = self.run_cli(
+            "draft-replace",
+            "--file",
+            "chapter1.tex",
+            "--old",
+            "Chapter body text.",
+            "--new",
+            "Rewritten chapter body.",
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn(r"\deleted[author=LLM]{Chapter body text.}", self.chapter.read_text())
+        self.assertIn(r"\added[author=LLM]{Rewritten chapter body.}", self.chapter.read_text())
+
+    def test_accept_draft_in_chapter(self):
+        self.run_cli(
+            "draft-replace",
+            "--file",
+            "chapter1.tex",
+            "--old",
+            "Chapter body text.",
+            "--new",
+            "Rewritten chapter body.",
+        )
+        did = self.draft_ids()[0]
+        self.run_cli("accept", "--id", did)
+        chapter = self.chapter.read_text()
+        self.assertIn("Rewritten chapter body.", chapter)
+        self.assertNotIn("latex-draft:", chapter)
+        self.assertNotIn(r"\added", chapter)
+
+    def test_reject_draft_in_chapter_restores(self):
+        original = self.chapter.read_text()
+        self.run_cli(
+            "draft-delete", "--file", "chapter1.tex", "--old", "Chapter body text."
+        )
+        did = self.draft_ids()[0]
+        self.run_cli("reject", "--id", did)
+        self.assertEqual(self.chapter.read_text(), original)
+
+    def test_draft_comment_in_chapter(self):
+        rc = self.run_cli(
+            "draft-comment",
+            "--file",
+            "chapter1.tex",
+            "--after",
+            "Chapter body text.",
+            "--text",
+            "TODO: expand.",
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn(r"\footnote{TODO: expand.}", self.chapter.read_text())
+
+    def test_file_must_be_an_input(self):
+        stranger = self.dir / "stranger.tex"
+        stranger.write_text("not part of the document\n")
+        rc = self.run_cli(
+            "draft-insert",
+            "--file",
+            "stranger.tex",
+            "--at-line",
+            "1",
+            "--text",
+            "x.",
+        )
+        self.assertEqual(rc, 2)
+        self.assertEqual(stranger.read_text(), "not part of the document\n")
+
+    def test_file_missing_fails(self):
+        rc = self.run_cli(
+            "draft-insert", "--file", "nope.tex", "--at-line", "1", "--text", "x."
+        )
+        self.assertEqual(rc, 2)
+
+    def test_anchor_searched_only_within_target_file(self):
+        # the anchor exists only in the chapter: anchoring without --file
+        # (main file) must fail, anchoring with --file must succeed
+        rc = self.run_cli("draft-insert", "--after", "Chapter body text.", "--text", "x.")
+        self.assertEqual(rc, 2)
+        rc = self.run_cli(
+            "draft-insert",
+            "--file",
+            "chapter1.tex",
+            "--after",
+            "Chapter body text.",
+            "--text",
+            "x.",
+        )
+        self.assertEqual(rc, 0)
+
+    def test_anchor_must_be_unique_within_its_file(self):
+        # the same line twice in the chapter makes the anchor ambiguous there
+        self.chapter.write_text("\\section{One}\nSame line.\nSame line.\n")
+        rc = self.run_cli(
+            "draft-insert",
+            "--file",
+            "chapter1.tex",
+            "--after",
+            "Same line.",
+            "--text",
+            "x.",
+        )
+        self.assertEqual(rc, 2)
+
+    def test_changelog_records_file(self):
+        from tools.latex_draft import read_changelog
+
+        self.run_cli(
+            "draft-insert",
+            "--file",
+            "chapter1.tex",
+            "--at-line",
+            "1",
+            "--text",
+            "x.",
+        )
+        entries = [e for e in read_changelog(self.tex) if e["kind"] == "change"]
+        self.assertEqual(entries[-1]["file"], "chapter1.tex")
+
+    def test_undo_restores_change_in_chapter(self):
+        original = self.chapter.read_text()
+        self.run_cli(
+            "draft-insert",
+            "--file",
+            "chapter1.tex",
+            "--at-line",
+            "1",
+            "--text",
+            "x.",
+        )
+        self.assertNotEqual(self.chapter.read_text(), original)
+        self.run_cli("undo")
+        self.assertEqual(self.chapter.read_text(), original)
+
+    def test_undo_turn_spans_multiple_files(self):
+        main_original = self.tex.read_text()
+        chapter_original = self.chapter.read_text()
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "in main.")
+        self.run_cli(
+            "draft-insert", "--file", "chapter1.tex", "--at-line", "1", "--text", "in chapter."
+        )
+        self.run_cli("compile")  # ends the turn
+        self.run_cli("undo", "--turn")
+        self.assertEqual(self.tex.read_text(), main_original)
+        self.assertEqual(self.chapter.read_text(), chapter_original)
+
+    def test_resolve_across_files_in_one_accept_all(self):
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "in main.")
+        self.run_cli(
+            "draft-insert", "--file", "chapter1.tex", "--at-line", "1", "--text", "in chapter."
+        )
+        rc = self.run_cli("accept", "--all")
+        self.assertEqual(rc, 0)
+        self.assertIn("in main.", self.tex.read_text())
+        self.assertIn("in chapter.", self.chapter.read_text())
+        self.assertNotIn("latex-draft:", self.tex.read_text())
+        self.assertNotIn("latex-draft:", self.chapter.read_text())
+
+    def test_changes_preamble_stripped_only_from_main(self):
+        # after resolving everything, the main file loses the injected
+        # preamble even if a chapter draft remains pending
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "in main.")
+        self.run_cli(
+            "draft-insert", "--file", "chapter1.tex", "--at-line", "1", "--text", "x."
+        )
+        self.run_cli("accept", "--all")
+        self.assertNotIn("usepackage[draft]{changes}", self.tex.read_text())
+
+
 class TestCompileAndStatus(LatexDraftCase):
     def test_compile_without_engine_warns_but_succeeds(self):
         # latexmk/pdflatex are not installed in this environment
