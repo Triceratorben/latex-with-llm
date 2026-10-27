@@ -522,7 +522,16 @@ def insert_block(
                     f"(lines {block_start + 1}-{i + 1})"
                 )
             block_start = None
-    lines[pos:pos] = block.split("\n")
+    # A draft block always occupies whole lines: ensure the line
+    # before the block ends with a newline (it does, since we split
+    # on "\n"), and ensure the line after the block starts fresh.
+    block_lines = block.split("\n")
+    # When inserting at EOF (pos == len(lines)), the block is the
+    # last content; make sure it ends with a newline so the end
+    # marker is on its own line.
+    if pos >= len(lines) and block_lines and block_lines[-1] != "":
+        block_lines.append("")
+    lines[pos:pos] = block_lines
     return "\n".join(lines)
 
 
@@ -602,17 +611,41 @@ def strip_changes_package_if_unused(text: str) -> str:
 
 def resolve_drafts(text: str, ids: set[str], accept: bool) -> tuple[str, set[str]]:
     found: set[str] = set()
+    # Sibling alternatives draft over the same original text: each sibling
+    # block repeats the same \\deleted{...} span. Resolving must splice the
+    # result in only ONCE for the whole group, not once per sibling —
+    # otherwise rejecting duplicates the restored text and accepting leaks
+    # the other alternatives' additions. Group siblings by their deleted
+    # span: the first block of a group performs the splice, the rest
+    # collapse to nothing.
+    done_groups: set[str] = set()
 
     def repl(m: re.Match) -> str:
         did = m.group(1)
         if did not in ids:
             return m.group(0)
         found.add(did)
+        # BLOCK_RE consumes the trailing newline after the end marker
+        # (the \n? in the pattern). When the match is immediately followed
+        # by another block (a sibling), the next block starts right after;
+        # when it is followed by a blank line (the original paragraph break
+        # that was behind the replaced text), that blank line survives.
+        # Re-attach the newline only when the following text does not start
+        # with one, so a reject restores the original line structure.
         had_nl = m.group(0).endswith("\n")
-        # Accept keeps the added text, reject restores the deleted text.
-        # (Alternatives are separate sibling blocks, not nested ones.)
         content = extract_command_content(m.group(2), "added" if accept else "deleted")
         if content is not None:
+            deleted = extract_command_content(m.group(2), "deleted")
+            if deleted is not None:
+                # A replace/delete draft: siblings share the deleted span.
+                # Splice only for the first sibling of the group; siblings
+                # collapse to nothing. When a sibling collapses, also drop
+                # a single blank line that separated it from the previous
+                # block, so the original paragraph structure is restored.
+                key = "del:" + deleted
+                if key in done_groups:
+                    return ""
+                done_groups.add(key)
             if content:
                 return content + ("\n" if had_nl else "")
             return ""
@@ -621,7 +654,7 @@ def resolve_drafts(text: str, ids: set[str], accept: bool) -> tuple[str, set[str
             if content is not None:
                 if not accept:
                     return ""
-                out = rf"\{cmd}{{{content}}}"
+                out = rf"\\{cmd}{{{content}}}"
                 return out + ("\n" if had_nl else "")
         return ""
 
@@ -762,8 +795,23 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
                 host = m  # innermost pending block containing the old text
         if host is not None:
             block = build_block(did, old=old, new=new, author=author)
-            sep = "" if text[host.end() :].startswith("\n") else "\n"
-            return text[: host.end()] + sep + block + text[host.end() :]
+            # BLOCK_RE consumes the trailing newline after the host's end
+            # marker, so host.end() is already at a line boundary. A blank
+            # line right after the host (the original paragraph break that
+            # was displaced when the first block replaced text inline) must
+            # stay AFTER all sibling blocks, not be split by them: skip it
+            # when placing the sibling.
+            insert_at = host.end()
+            rest = text[insert_at:]
+            m_blank = re.match(r"\n(?:[ \t]*\n)?", rest)
+            blank = m_blank.group(0) if m_blank else ""
+            insert_at += len(blank)
+            rest = text[insert_at:]
+            # The end marker must never glue to a following line (e.g.
+            # \end{document} at EOF): ensure a newline after the block
+            # when the rest does not start with one.
+            end_sep = "" if (rest.startswith("\n") or not rest) else "\n"
+            return text[:insert_at] + block + end_sep + rest
         if text.count(old) == 1:
             return text.replace(old, build_block(did, old=old, new=new, author=author))
         raise DraftError(
@@ -913,6 +961,9 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
     # one resolves its siblings: they describe a change to text that no
     # longer exists, so remove their blocks and mark them rejected (the user
     # sees what was discarded; rejecting them afterwards is a clean error).
+    # All siblings (accepted and orphaned) go into the same resolve_drafts
+    # call so the group-dedup logic in resolve_drafts collapses the shared
+    # span correctly.
     sibling_ids: set[str] = set()
     if accept:
         for fname, file_ids in by_file.items():
@@ -945,23 +996,24 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
 
     for fname, file_ids in by_file.items():
         target = tex if fname == tex.name else tex.parent / fname
-        reject_ids = {d for d in sibling_ids if state["drafts"][d].get("file", tex.name) == fname}
+        # Resolve the requested drafts and their orphaned siblings in one
+        # pass: resolve_drafts deduplicates sibling groups by their shared
+        # deleted span, so the original text is restored/merged exactly once.
+        all_ids = set(file_ids)
+        if accept:
+            all_ids |= {
+                d
+                for d in sibling_ids
+                if state["drafts"][d].get("file", tex.name) == fname
+            }
 
-        def fn(text: str, file_ids=file_ids, reject_ids=reject_ids) -> str:
-            new_text, found = resolve_drafts(text, set(file_ids), accept)
-            missing = set(file_ids) - found
+        def fn(text: str, file_ids=all_ids) -> str:
+            new_text, found = resolve_drafts(text, file_ids, accept)
+            missing = file_ids - found
             if missing:
                 raise DraftError(
                     f"draft(s) not found in {fname}: " + ", ".join(sorted(missing))
                 )
-            if reject_ids:
-                new_text, rej_found = resolve_drafts(new_text, reject_ids, False)
-                missing_rej = reject_ids - rej_found
-                if missing_rej:
-                    raise DraftError(
-                        f"sibling draft(s) not found in {fname}: "
-                        + ", ".join(sorted(missing_rej))
-                    )
             if target == tex:
                 return strip_changes_package_if_unused(new_text)
             return new_text

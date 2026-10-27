@@ -1091,6 +1091,99 @@ class TestPrune(LatexDraftCase):
         self.assertEqual(len(remaining), 6)
 
 
+class TestSiblingGroupResolution(LatexDraftCase):
+    """Regression tests for the sibling-duplication bug: rejecting or
+    accepting a group of alternatives over the same --old must splice the
+    result exactly once, not once per sibling."""
+
+    def _draft_three_alternatives(self):
+        self.run_cli(
+            "draft-replace", "--author", "A",
+            "--old", "Small problems are worth studying.",
+            "--new", "Small problems are worth studying. Variant A.",
+        )
+        self.run_cli(
+            "draft-replace", "--author", "B",
+            "--old", "Small problems are worth studying.",
+            "--new", "Small problems are worth studying. Variant B.",
+        )
+        self.run_cli(
+            "draft-replace", "--author", "C",
+            "--old", "Small problems are worth studying.",
+            "--new", "Small problems are worth studying. Variant C.",
+        )
+
+    def test_reject_all_siblings_restores_once(self):
+        original = self.tex.read_text()
+        self._draft_three_alternatives()
+        rc = self.run_cli("reject", "--all")
+        self.assertEqual(rc, 0)
+        # byte-identical to the pre-draft state
+        self.assertEqual(self.tex.read_text(), original)
+
+    def test_accept_one_sibling_merges_once(self):
+        self._draft_three_alternatives()
+        id_a = self.draft_ids()[0]
+        rc = self.run_cli("accept", "--id", id_a)
+        self.assertEqual(rc, 0)
+        text = self.tex.read_text()
+        # the accepted version appears exactly once
+        self.assertEqual(text.count("Variant A."), 1)
+        # the rejected siblings' versions are gone
+        self.assertNotIn("Variant B.", text)
+        self.assertNotIn("Variant C.", text)
+        # the original text is gone (replaced, not duplicated)
+        self.assertNotIn("Small problems are worth studying.\n", text)
+        # siblings are marked rejected (orphaned)
+        for did in self.draft_ids()[1:]:
+            self.assertEqual(self.state()["drafts"][did]["status"], "rejected")
+            self.assertTrue(self.state()["drafts"][did].get("orphaned_by_overlap"))
+
+    def test_reject_all_at_eof_preserves_end_document(self):
+        # the draft block at EOF must not glue its end marker to \end{document}
+        self.tex.write_text(
+            "\\documentclass{article}\n"
+            "\\begin{document}\n"
+            "Final sentence.\n"
+            "\\end{document}\n"
+        )
+        original = self.tex.read_text()
+        self.run_cli(
+            "draft-replace", "--author", "A",
+            "--old", "Final sentence.",
+            "--new", "Final sentence. Variant A.",
+        )
+        self.run_cli(
+            "draft-replace", "--author", "B",
+            "--old", "Final sentence.",
+            "--new", "Final sentence. Variant B.",
+        )
+        # the end marker must be on its own line, not glued to \end{document}
+        drafted = self.tex.read_text()
+        self.assertIn("\n% latex-draft-end:", drafted)  # end marker on its own line
+        rc = self.run_cli("reject", "--all")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.tex.read_text(), original)
+
+    def test_two_independent_replaces_both_resolve(self):
+        # two unrelated drafts (different --old) must both resolve
+        self.run_cli(
+            "draft-replace",
+            "--old", "Small problems are worth studying.",
+            "--new", "Replaced one.",
+        )
+        self.run_cli(
+            "draft-insert",
+            "--at-line", "1",
+            "--text", "Inserted.",
+        )
+        rc = self.run_cli("accept", "--all")
+        self.assertEqual(rc, 0)
+        text = self.tex.read_text()
+        self.assertIn("Replaced one.", text)
+        self.assertIn("Inserted.", text)
+
+
 class TestMultiParagraphDrafts(LatexDraftCase):
     r"""The changes package cannot take a blank line inside \added/\deleted
     ("Paragraph ended before \addcontentsline was complete"). Multi-paragraph
