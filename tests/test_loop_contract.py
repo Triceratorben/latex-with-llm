@@ -332,6 +332,19 @@ class TestRevertSafetyNet(LoopCase):
         self.assertEqual(self.cli("undo", "--force"), 0)
         self.assertEqual((self.dir / "ch1.tex").read_text(), "Chapter body.\n")
 
+    def test_undo_turn_twice_is_a_clean_noop(self):
+        """A second `undo --turn` in the same turn must report, not crash."""
+        (self.dir / "ch1.tex").unlink()
+        self.tex.write_text(
+            "\\documentclass{article}\n\\begin{document}\nAlpha.\n\\end{document}\n"
+        )
+        self.assertEqual(self.cli("draft-insert", "--after", "Alpha.", "--text", "Beta."), 0)
+        self.assertEqual(self.cli("undo", "--turn"), 0)
+        rc, out, err = self.cli_out("undo", "--turn")
+        self.assertEqual(rc, 0)
+        self.assertIn("already undone", out + err)
+        self.assertNotIn("Beta.", self.text())
+
     def test_status_and_check_survive_a_deleted_chapter(self):
         self._draft_into_chapter()
         (self.dir / "ch1.tex").unlink()

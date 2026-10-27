@@ -50,6 +50,9 @@ INPUT_RE = re.compile(r"\\(?:input|include)(?:\[[^\]]*\])?\{([^}]+)\}")
 SUBFILE_RE = re.compile(r"\\subfile\{([^}]+)\}")
 IMPORT_RE = re.compile(r"\\import\{([^}]+)\}\{([^}]+)\}")
 EOL_RE = re.compile(r"\r\n|\r|\n")
+# A marker line on its own (BLOCK_RE matches the whole block instead).
+BLOCK_BEGIN_LINE_RE = re.compile(r"% latex-draft:[0-9a-f]{8}")
+BLOCK_END_LINE_RE = re.compile(r"% latex-draft-end:[0-9a-f]{8}")
 
 
 class DraftError(Exception):
@@ -184,6 +187,17 @@ def write_tex(path: Path, text: str) -> None:
     """Write a .tex file without newline translation (see read_tex)."""
     with path.open("w", encoding="utf-8", newline="") as fh:
         fh.write(text)
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Replace `path` through a temp sibling in the same directory.
+
+    os.replace is atomic, so a crash mid-write cannot leave the user's file
+    half written.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    write_tex(tmp, text)
+    os.replace(tmp, path)
 
 
 def newline_of(text: str) -> str:
@@ -354,8 +368,13 @@ def current_hashes(tex: Path) -> dict[str, str]:
     return hashes
 
 
+def now() -> str:
+    """Timestamp for changelog entries and draft records (second precision)."""
+    return datetime.now().isoformat(timespec="seconds")
+
+
 def append_changelog(tex: Path, entry: dict) -> None:
-    entry = {"time": datetime.now().isoformat(timespec="seconds"), **entry}
+    entry = {"time": now(), **entry}
     with changelog_path(tex).open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, sort_keys=True) + "\n")
 
@@ -468,6 +487,11 @@ def _dep_copy_name(tex: Path, dep: Path) -> str:
     return "__".join(rel.parts)
 
 
+def _note_path(snap: Path) -> Path:
+    """Sidecar file holding a snapshot's note."""
+    return snap.with_suffix(snap.suffix + ".note")
+
+
 def snapshot(
     tex: Path, note: str = "", full: bool = False, files: list[Path] | None = None
 ) -> Path:
@@ -493,7 +517,7 @@ def snapshot(
             continue
         shutil.copy2(dep, bdir / f"{dest.stem}__{_dep_copy_name(tex, dep)}")
     if note:
-        dest.with_suffix(dest.suffix + ".note").write_text(note + "\n")
+        _note_path(dest).write_text(note + "\n")
     if not full:
         prune(tex)
     return dest
@@ -516,41 +540,34 @@ def prune(tex: Path) -> None:
     old, one per hour for 24h, one per day for 30d."""
     bdir = backups_dir(tex)
     snaps = list_snapshots(tex)
-    now = time.time()
+    reference = time.time()
     keep: set[Path] = set()
     hours: set[str] = set()
     days: set[str] = set()
     for s in snaps:  # newest first
-        note_file = s.with_suffix(s.suffix + ".note")
-        if note_file.exists() and "initial backup" in note_file.read_text():
-            keep.add(s)
-            continue
         m = SNAP_RE.match(s.name)
-        if not m:
-            keep.add(s)
+        note = _note_path(s)
+        if not m or (note.exists() and "initial backup" in note.read_text()):
+            keep.add(s)  # unparseable or the initial full backup: never prune
             continue
-        t = time.mktime(time.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S"))
-        age = now - t
+        dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        age = reference - dt.timestamp()
+        hour, day = dt.strftime("%Y%m%d-%H"), dt.strftime("%Y%m%d")
         if age < 3600:
             keep.add(s)
-            continue
-        hb = time.strftime("%Y%m%d-%H", time.localtime(t))
-        db = time.strftime("%Y%m%d", time.localtime(t))
-        if age < 86400 and hb not in hours:
-            hours.add(hb)
+        elif age < 86400 and hour not in hours:
+            hours.add(hour)
             keep.add(s)
-            continue
-        if age < 30 * 86400 and db not in days:
-            days.add(db)
+        elif age < 30 * 86400 and day not in days:
+            days.add(day)
             keep.add(s)
     for s in snaps:
-        if s not in keep:
-            s.unlink()
-            note = s.with_suffix(s.suffix + ".note")
-            if note.exists():
-                note.unlink()
-            for dep_snap in bdir.glob(f"{s.stem}__*.tex"):
-                dep_snap.unlink()
+        if s in keep:
+            continue
+        s.unlink()
+        for extra in (_note_path(s), *bdir.glob(f"{s.stem}__*.tex")):
+            if extra.exists():
+                extra.unlink()
 
 
 def ensure_full_backup(tex: Path, state: dict) -> None:
@@ -733,6 +750,11 @@ def split_paragraphs(text: str) -> list[str]:
     return re.split(r"\n[ \t]*\n", text)
 
 
+def _marker_block(did: str, body: str) -> str:
+    """Wrap a draft body in its `% latex-draft` marker comments."""
+    return "\n".join([f"% latex-draft:{did}", body, f"% latex-draft-end:{did}"])
+
+
 def build_block(
     did: str,
     old: str | None = None,
@@ -764,8 +786,8 @@ def build_comment_block(did: str, text: str, margin: bool = False) -> str:
     and does not shift pagination.
     """
     safe = _escape_unbalanced_braces(text)
-    cmd = rf"\todo{{{safe}}}" if margin else rf"\footnote{{{safe}}}"
-    return "\n".join([f"% latex-draft:{did}", cmd, f"% latex-draft-end:{did}"])
+    cmd = "\\todo" if margin else "\\footnote"
+    return _marker_block(did, f"{cmd}{{{safe}}}")
 
 
 def build_preamble_block(did: str, text: str) -> str:
@@ -781,7 +803,7 @@ def build_preamble_block(did: str, text: str) -> str:
     draft — accepting merges it verbatim, rejecting removes it. The PDF
     review shows the effect (e.g. Roman numeral section headings).
     """
-    return "\n".join([f"% latex-draft:{did}", text, f"% latex-draft-end:{did}"])
+    return _marker_block(did, text)
 
 
 def block_for(text: str, block: str) -> str:
@@ -792,15 +814,6 @@ def block_for(text: str, block: str) -> str:
     user reviews, and in the diff of their VCS).
     """
     return to_newline(block, newline_of(text))
-
-
-def find_preamble_end(text: str) -> int:
-    """Line index (0-based) of \\begin{document} — the end of the preamble.
-    Raises DraftError when the document has no \\begin{document}."""
-    for i, line in enumerate(split_lines(text)):
-        if line.strip().startswith("\\begin{document}"):
-            return i
-    raise DraftError("no \\begin{document} found — cannot locate the preamble")
 
 
 def document_bounds(lines: list[str]) -> tuple[int, int] | None:
@@ -822,6 +835,34 @@ def document_bounds(lines: list[str]) -> tuple[int, int] | None:
     return begin, end if end is not None else len(lines)
 
 
+def find_preamble_end(text: str) -> int:
+    """Line index (0-based) of \\begin{document} — the end of the preamble.
+    Raises DraftError when the document has no \\begin{document}."""
+    bounds = document_bounds(split_lines(text))
+    if bounds is None:
+        raise DraftError("no \\begin{document} found — cannot locate the preamble")
+    return bounds[0]
+
+
+def visible_line_indices(lines: list[str], skip_injected: bool = True) -> list[int]:
+    """Indices of the lines the user sees in their own numbering.
+
+    Pending draft blocks are not part of the document yet, so --at-line must
+    skip them; two drafts at the same visible line then land at the same
+    place. `skip_injected` also hides the auto-injected changes preamble.
+    """
+    out: list[int] = []
+    in_block = False
+    for i, line in enumerate(lines):
+        if in_block:
+            in_block = not BLOCK_END_LINE_RE.fullmatch(line)
+        elif BLOCK_BEGIN_LINE_RE.fullmatch(line):
+            in_block = True
+        elif not (skip_injected and injected_preamble_line(line)):
+            out.append(i)
+    return out
+
+
 def insert_block(
     text: str,
     block: str,
@@ -833,58 +874,19 @@ def insert_block(
     if at_line is not None:
         if at_line < 1:
             raise DraftError(f"--at-line must be >= 1, got {at_line}")
-        # validate the bound first: count the visible lines (same skip rules
-        # as the walk below)
-        total_visible = 0
-        _in_block = False
-        for line in lines:
-            if _in_block:
-                if re.fullmatch(r"% latex-draft-end:[0-9a-f]{8}", line):
-                    _in_block = False
-                continue
-            if re.fullmatch(r"% latex-draft:[0-9a-f]{8}", line):
-                _in_block = True
-                continue
-            if injected_preamble_line(line):
-                continue
-            total_visible += 1
-        if at_line > total_visible:
+        visible = visible_line_indices(lines)
+        if at_line > len(visible):
             raise DraftError(
                 f"--at-line {at_line} is beyond the end of the document "
-                f"({total_visible} visible lines)"
+                f"({len(visible)} visible lines)"
             )
-        # The user numbers lines of their own document. Skip the auto-injected
-        # changes preamble and any pending draft blocks, which are not part of
-        # the visible document yet: pos ends up just before the at_line-th
-        # visible line.
-        pos = 0
-        visible = 0
-        in_block = False
-        while pos < len(lines) and visible < at_line - 1:
-            line = lines[pos]
-            if in_block:
-                if re.fullmatch(r"% latex-draft-end:[0-9a-f]{8}", line):
-                    in_block = False
-                pos += 1
-                continue
-            if injected_preamble_line(line) or re.fullmatch(
-                r"% latex-draft:[0-9a-f]{8}", line
-            ):
-                if re.fullmatch(r"% latex-draft:[0-9a-f]{8}", line):
-                    in_block = True
-                pos += 1
-                continue
-            visible += 1
-            pos += 1
-        pos = min(pos, len(lines))
-        # never insert before \documentclass or split the injected preamble
+        pos = visible[at_line - 1]
+        # never insert before \documentclass
         dc = max(
-            (i for i, l in enumerate(lines) if l.startswith("\\documentclass")),
+            (i for i, line in enumerate(lines) if line.startswith("\\documentclass")),
             default=-1,
         )
         pos = max(pos, dc + 1)
-        while pos < len(lines) and injected_preamble_line(lines[pos]):
-            pos += 1
     else:
         needle = after if after is not None else before
         hits = [i for i, line in enumerate(lines) if needle in line]
@@ -909,11 +911,10 @@ def insert_block(
             )
     block_start: int | None = None
     for i, line in enumerate(lines):
-        if block_start is None and re.fullmatch(r"% latex-draft:[0-9a-f]{8}", line):
-            block_start = i
-        elif block_start is not None and re.fullmatch(
-            r"% latex-draft-end:[0-9a-f]{8}", line
-        ):
+        if block_start is None:
+            if BLOCK_BEGIN_LINE_RE.fullmatch(line):
+                block_start = i
+        elif BLOCK_END_LINE_RE.fullmatch(line):
             if block_start < pos <= i:
                 raise DraftError(
                     f"insertion point is inside existing draft block "
@@ -1136,13 +1137,18 @@ def resolve_drafts(
     return BLOCK_RE.subn(repl, text)[0], found, spliced
 
 
+def _file_of(tex: Path, fname: str) -> Path:
+    """Path of a file of the document from the name recorded in a draft."""
+    return tex if fname == tex.name else tex.parent / fname
+
+
 def draft_record(did: str, op: str, preview_text: str) -> dict:
     preview = " ".join(preview_text.split())[:120]
     return {
         "id": did,
         "op": op,
         "status": "pending",
-        "created": datetime.now().isoformat(timespec="seconds"),
+        "created": now(),
         "preview": preview,
     }
 
@@ -1173,9 +1179,7 @@ def mutate(tex: Path, state: dict, note: str, fn, target: Path | None = None) ->
         "before": before_text,
         "after": new_text,
     }
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    write_tex(tmp, new_text)
-    os.replace(tmp, target)
+    _atomic_write(target, new_text)
     append_changelog(tex, entry)
     state["file_hashes"] = current_hashes(tex)
     return snap
@@ -1202,6 +1206,44 @@ def _validate_target(fn, target: Path, tex: Path) -> str | None:
     return None
 
 
+def _apply_draft(
+    tex: Path,
+    state: dict,
+    target: Path,
+    fn,
+    did: str,
+    op: str,
+    preview: str,
+    author: str,
+    preamble_margin: bool = False,
+    fields: dict | None = None,
+) -> int:
+    """Validate, prepare the main preamble, write, and register one draft.
+
+    The validation must run before `ensure_document_preamble`: a draft aimed
+    at a chapter needs the main file's preamble, and a refused draft must
+    leave the main file untouched. `preamble_margin` loads todonotes for a
+    margin-note comment; `fields` are extra draft-record keys.
+    """
+    error = _validate_target(fn, target, tex)
+    if error:
+        print(f"latex-draft: {error}", file=sys.stderr)
+        return 2
+    if target.resolve() != tex.resolve():
+        ensure_document_preamble(tex, state, author, margin=preamble_margin)
+    try:
+        mutate(tex, state, f"draft {op} {did}", fn, target=target)
+    except DraftError as e:
+        print(f"latex-draft: {e}", file=sys.stderr)
+        return 2
+    record = draft_record(did, op, preview)
+    record.update({"file": target.name, "author": author, **(fields or {})})
+    state["drafts"][did] = record
+    save_state(tex, state)
+    print(f"latex-draft: drafted {op} {did} in {target.name}")
+    return 0
+
+
 def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
     did = new_id(state)
     author = getattr(args, "author", None) or DEFAULT_AUTHOR
@@ -1222,24 +1264,7 @@ def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
             at_line=args.at_line,
         )
 
-    error = _validate_target(fn, target, tex)
-    if error:
-        print(f"latex-draft: {error}", file=sys.stderr)
-        return 2
-    if target != tex:
-        ensure_document_preamble(tex, state, author)
-
-    try:
-        mutate(tex, state, f"draft insert {did}", fn, target=target)
-    except DraftError as e:
-        print(f"latex-draft: {e}", file=sys.stderr)
-        return 2
-    state["drafts"][did] = draft_record(did, "insert", args.text)
-    state["drafts"][did]["file"] = target.name
-    state["drafts"][did]["author"] = author
-    save_state(tex, state)
-    print(f"latex-draft: drafted insert {did} in {target.name}")
-    return 0
+    return _apply_draft(tex, state, target, fn, did, "insert", args.text, author)
 
 
 def resolve_target(tex: Path, file_arg: str | None) -> Path | None:
@@ -1411,27 +1436,8 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
             file=sys.stderr,
         )
         return 2
-    # Validate the draft against its target before the main file's preamble
-    # is prepared, so a refused draft leaves every file untouched.
-    error = _validate_target(fn, target, tex)
-    if error:
-        print(f"latex-draft: {error}", file=sys.stderr)
-        return 2
-    if target != tex:
-        ensure_document_preamble(tex, state, author)
-
-    try:
-        mutate(tex, state, f"draft {op} {did}", fn, target=target)
-    except DraftError as e:
-        print(f"latex-draft: {e}", file=sys.stderr)
-        return 2
     preview = new if op == "replace" else old
-    state["drafts"][did] = draft_record(did, op, preview)
-    state["drafts"][did]["file"] = target.name
-    state["drafts"][did]["author"] = author
-    save_state(tex, state)
-    print(f"latex-draft: drafted {op} {did} in {target.name}")
-    return 0
+    return _apply_draft(tex, state, target, fn, did, op, preview, author)
 
 
 def cmd_draft_replace(tex: Path, state: dict, args: argparse.Namespace) -> int:
@@ -1467,25 +1473,10 @@ def cmd_draft_comment(tex: Path, state: dict, args: argparse.Namespace) -> int:
             at_line=args.at_line,
         )
 
-    error = _validate_target(fn, target, tex)
-    if error:
-        print(f"latex-draft: {error}", file=sys.stderr)
-        return 2
-    if target != tex:
-        ensure_document_preamble(tex, state, author, margin=margin)
-
-    try:
-        mutate(tex, state, f"draft comment {did}", fn, target=target)
-    except DraftError as e:
-        print(f"latex-draft: {e}", file=sys.stderr)
-        return 2
-    state["drafts"][did] = draft_record(did, "comment", args.text)
-    state["drafts"][did]["file"] = target.name
-    state["drafts"][did]["author"] = author
-    state["drafts"][did]["margin"] = margin
-    save_state(tex, state)
-    print(f"latex-draft: drafted comment {did} in {target.name}")
-    return 0
+    return _apply_draft(
+        tex, state, target, fn, did, "comment", args.text, author,
+        preamble_margin=margin, fields={"margin": margin},
+    )
 
 
 def ensure_todonotes_package(text: str) -> str:
@@ -1542,19 +1533,11 @@ def cmd_draft_preamble(tex: Path, state: dict, args: argparse.Namespace) -> int:
             # Search preamble lines only (before \begin{document}), skipping
             # lines inside pending draft blocks: an anchor must refer to a
             # line of the user's own preamble.
-            hits = []
-            in_block = False
-            for i, line in enumerate(lines):
-                if i >= bd:
-                    break
-                if re.fullmatch(r"% latex-draft:[0-9a-f]{8}", line):
-                    in_block = True
-                if in_block:
-                    if re.fullmatch(r"% latex-draft-end:[0-9a-f]{8}", line):
-                        in_block = False
-                    continue
-                if position in line:
-                    hits.append(i)
+            hits = [
+                i
+                for i in visible_line_indices(lines, skip_injected=False)
+                if i < bd and position in lines[i]
+            ]
             if len(hits) != 1:
                 raise DraftError(
                     f"anchor {position!r} matched {len(hits)} preamble lines "
@@ -1588,6 +1571,100 @@ def cmd_list(tex: Path, state: dict, args: argparse.Namespace) -> int:
             f"{rec['created']}  {rec['preview']}"
         )
     return 0
+
+
+def _sibling_ids(
+    tex: Path, state: dict, by_file: dict[str, list[str]], ids: list[str]
+) -> set[str]:
+    """Pending drafts that are alternatives to the drafts being accepted.
+
+    Siblings share one \\deleted span: they describe changes to the same
+    original text, so resolving the accepted one orphans the rest.
+    """
+    siblings: set[str] = set()
+    for fname, file_ids in by_file.items():
+        blocks = list(BLOCK_RE.finditer(read_tex(_file_of(tex, fname))))
+        accepted_old: set[str] = set()
+        for m in blocks:
+            if m.group(1) in file_ids:
+                deleted = extract_command_content(m.group(2), "deleted")
+                if deleted is not None:
+                    accepted_old.add(deleted)
+        for did, rec in state["drafts"].items():
+            if (
+                did in ids
+                or rec["status"] != "pending"
+                or rec.get("file", tex.name) != fname
+            ):
+                continue
+            for m in blocks:
+                if m.group(1) != did:
+                    continue
+                deleted = extract_command_content(m.group(2), "deleted")
+                if deleted is not None and deleted in accepted_old:
+                    siblings.add(did)
+                break
+    return siblings
+
+
+def _close_missing_blocks(
+    tex: Path, state: dict, ids: list[str], by_file: dict[str, list[str]], all_drafts: bool
+) -> tuple[list[str], dict[str, list[str]], int | None]:
+    """Handle drafts whose block was hand-deleted from the document.
+
+    A vanished block cannot be resolved. With `--all` its record is closed and
+    the surviving drafts are resolved; for one specific id the command refuses
+    up front, so no file is left resolved while the state claims it pending.
+    """
+    missing: dict[str, list[str]] = {}
+    for fname, file_ids in by_file.items():
+        try:
+            file_text = read_tex(_file_of(tex, fname))
+        except (OSError, DraftError):
+            file_text = ""
+        gone = [
+            did
+            for did in file_ids
+            if not any(m.group(1) == did for m in BLOCK_RE.finditer(file_text))
+        ]
+        if gone:
+            missing[fname] = gone
+    if not missing:
+        return ids, by_file, None
+    for fname, gone in missing.items():
+        where = ", ".join(sorted(gone))
+        if all_drafts:
+            print(
+                f"latex-draft: draft(s) no longer in {fname}, marked as "
+                f"rejected: {where}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"latex-draft: draft(s) not found in {fname}: {where}",
+                  file=sys.stderr)
+        for did in gone:
+            rec = state["drafts"][did]
+            rec["status"] = "rejected"
+            rec["resolved"] = now()
+            rec["hand_deleted"] = True
+    save_state(tex, state)
+    if not all_drafts:
+        return ids, by_file, 2
+    for fname, gone in missing.items():
+        ids = [did for did in ids if did not in gone]
+        by_file[fname] = [d for d in by_file[fname] if d not in gone]
+    return ids, by_file, None
+
+
+def _strip_unused_preamble(tex: Path, state: dict, injected: list[str]) -> None:
+    """Remove the auto-injected preamble once no draft is pending anywhere."""
+    mutate(
+        tex,
+        state,
+        "strip unused changes preamble",
+        lambda text: strip_changes_package_if_unused(text, injected),
+    )
+    state["injected_preamble"] = []
 
 
 def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> int:
@@ -1631,86 +1708,11 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
         did not in ids and rec["status"] == "pending"
         for did, rec in state["drafts"].items()
     )
-    sibling_ids: set[str] = set()
-    if accept:
-        for fname, file_ids in by_file.items():
-            target = tex if fname == tex.name else tex.parent / fname
-            sibling_text = read_tex(target)
-            accepted_old: set[str] = set()
-            for did in file_ids:
-                for m in BLOCK_RE.finditer(sibling_text):
-                    if m.group(1) == did:
-                        deleted = extract_command_content(m.group(2), "deleted")
-                        if deleted is not None:
-                            accepted_old.add(deleted)
-            for did, rec in state["drafts"].items():
-                if (
-                    did in ids
-                    or rec["status"] != "pending"
-                    or rec.get("file", tex.name) != fname
-                ):
-                    continue
-                m = None
-                for cand in BLOCK_RE.finditer(sibling_text):
-                    if cand.group(1) == did:
-                        m = cand
-                        break
-                if m is None:
-                    continue
-                deleted = extract_command_content(m.group(2), "deleted")
-                if deleted is not None and deleted in accepted_old:
-                    sibling_ids.add(did)
+    sibling_ids = _sibling_ids(tex, state, by_file, ids) if accept else set()
 
-    # A draft block hand-deleted from the document cannot be resolved. When a
-    # specific draft was asked for, refuse up front so the other files are
-    # not left resolved while the state still claims them pending. With
-    # `--all`, close the vanished records (the block is gone; nothing is
-    # pending for them any more) and resolve the drafts that still exist.
-    missing_by_file: dict[str, list[str]] = {}
-    for fname, file_ids in by_file.items():
-        target = tex if fname == tex.name else tex.parent / fname
-        try:
-            file_text = read_tex(target)
-        except (OSError, DraftError):
-            file_text = ""
-        missing_here = [
-            did
-            for did in file_ids
-            if not any(m.group(1) == did for m in BLOCK_RE.finditer(file_text))
-        ]
-        if missing_here:
-            missing_by_file[fname] = missing_here
-    if missing_by_file:
-        if not args.all:
-            for fname, missing_here in missing_by_file.items():
-                print(
-                    "latex-draft: draft(s) not found in "
-                    f"{fname}: " + ", ".join(sorted(missing_here)),
-                    file=sys.stderr,
-                )
-            for missing_here in missing_by_file.values():
-                for did in missing_here:
-                    rec = state["drafts"][did]
-                    rec["status"] = "rejected"
-                    rec["resolved"] = datetime.now().isoformat(timespec="seconds")
-                    rec["hand_deleted"] = True
-            save_state(tex, state)
-            return 2
-        for fname, missing_here in missing_by_file.items():
-            print(
-                "latex-draft: draft(s) no longer in "
-                f"{fname}, marked as rejected: "
-                + ", ".join(sorted(missing_here)),
-                file=sys.stderr,
-            )
-            for did in missing_here:
-                rec = state["drafts"][did]
-                rec["status"] = "rejected"
-                rec["resolved"] = datetime.now().isoformat(timespec="seconds")
-                rec["hand_deleted"] = True
-            ids = [did for did in ids if did not in missing_here]
-            by_file[fname] = [d for d in by_file[fname] if d not in missing_here]
-        save_state(tex, state)
+    ids, by_file, error = _close_missing_blocks(tex, state, ids, by_file, args.all)
+    if error is not None:
+        return error
     # The provenance list is emptied once the preamble is stripped; an undo
     # of that strip brings the lines back, so recover them from the changelog
     # rather than leaving them in the document forever.
@@ -1718,7 +1720,7 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
     for fname, file_ids in by_file.items():
         if not file_ids:
             continue
-        target = tex if fname == tex.name else tex.parent / fname
+        target = _file_of(tex, fname)
         # Resolve the requested drafts and their orphaned siblings in one
         # pass: resolve_drafts deduplicates sibling groups by their shared
         # deleted span, so the original text is restored/merged exactly once.
@@ -1764,28 +1766,22 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
         accepted_ids = {
             did for did in ids if did in spliced_ids or did not in sibling_ids
         }
+    stamp = now()
     for did in ids:
         state["drafts"][did]["status"] = (
             "accepted" if did in accepted_ids else "rejected"
         )
-        state["drafts"][did]["resolved"] = datetime.now().isoformat(
-            timespec="seconds"
-        )
-    now = datetime.now().isoformat(timespec="seconds")
+        state["drafts"][did]["resolved"] = stamp
     for did in sibling_ids:
         rec = state["drafts"][did]
         rec["status"] = "rejected"
-        rec["resolved"] = now
+        rec["resolved"] = stamp
         rec["orphaned_by_overlap"] = True
     # Once no draft markers remain anywhere in the document, strip the
     # auto-injected preamble from the main file (some classes reject the
     # changes package in final mode).
     if not any(rec["status"] == "pending" for rec in state["drafts"].values()):
-        def strip_fn(text: str) -> str:
-            return strip_changes_package_if_unused(text, injected)
-
-        mutate(tex, state, "strip unused changes preamble", strip_fn)
-        state["injected_preamble"] = []
+        _strip_unused_preamble(tex, state, injected)
     save_state(tex, state)
     note = ""
     if sibling_ids:
@@ -1950,20 +1946,6 @@ def analyze_log(tex: Path) -> list[dict]:
     if EMERGENCY_STOP_RE.search(text) and not problems:
         problems.append({"kind": "emergency-stop", "detail": "! Emergency stop."})
     return problems
-
-
-def find_line_in_files(tex: Path, needle: str) -> tuple[Path, int] | None:
-    """Find the first file (main or input) containing `needle`; returns
-    (file, 1-based line number)."""
-    for f in watched_files(tex):
-        try:
-            lines = read_tex(f).splitlines()
-        except (OSError, DraftError):
-            continue
-        for i, line in enumerate(lines, start=1):
-            if needle in line:
-                return f, i
-    return None
 
 
 def _first_unpaired_end(text: str, env: str) -> int | None:
@@ -2150,8 +2132,8 @@ def cmd_repair(tex: Path, state: dict, args: argparse.Namespace) -> int:
                 )
             return 0
         print(
-            f"latex-draft: repair applied but compile still fails; "
-            f"remaining problems:",
+            "latex-draft: repair applied but compile still fails; "
+            "remaining problems:",
             file=sys.stderr,
         )
         for p in analyze_log(tex):
@@ -2174,10 +2156,8 @@ def _reconcile_draft_status(tex: Path, state: dict) -> None:
     the undo brought back is pending once more; a pending record whose block
     is gone (the change that created it was undone) is closed."""
     for did, rec in state["drafts"].items():
-        fname = rec.get("file", tex.name)
-        target = tex if fname == tex.name else tex.parent / fname
         try:
-            text = read_tex(target)
+            text = read_tex(_file_of(tex, rec.get("file", tex.name)))
         except (OSError, DraftError):
             continue
         has_block = any(m.group(1) == did for m in BLOCK_RE.finditer(text))
@@ -2187,7 +2167,44 @@ def _reconcile_draft_status(tex: Path, state: dict) -> None:
             rec.pop("orphaned_by_overlap", None)
         elif not has_block and rec["status"] == "pending":
             rec["status"] = "rejected"
-            rec["resolved"] = datetime.now().isoformat(timespec="seconds")
+            rec["resolved"] = now()
+
+
+def _undo_targets(
+    tex: Path, state: dict, args: argparse.Namespace
+) -> tuple[list[dict], int | None]:
+    """The changelog entries an undo reverts, plus an exit code when there is
+    nothing to revert.
+
+    `--turn` reverts the current turn, or the most recent turn that has
+    changes (the common case: `undo` after `compile`). Entries a trailing run
+    of undos already reverted are skipped, so `undo --turn` cannot loop.
+    """
+    entries = [e for e in read_changelog(tex) if e.get("kind") == "change"]
+    if not entries:
+        print("latex-draft: changelog is empty, nothing to undo", file=sys.stderr)
+        return [], 1
+    if not args.turn:
+        if args.n < 1:
+            print("latex-draft: --n must be >= 1", file=sys.stderr)
+            return [], 2
+        return entries[-args.n :], None
+    turn = state.get("turn", 0)
+    targets = [e for e in entries if e.get("turn", 0) == turn]
+    if not targets:
+        turn = max(e.get("turn", 0) for e in entries)
+        targets = [e for e in entries if e.get("turn", 0) == turn]
+    undone: set[str] = set()
+    for e in reversed(read_changelog(tex)):
+        if e.get("kind") != "undo":
+            break
+        undone.add(e.get("undid_backup"))
+    targets = [e for e in targets if e.get("backup") not in undone]
+    if not targets:
+        print(f"latex-draft: turn {turn} is already undone (last action was "
+              "`undo`)")
+        return [], 0
+    return targets, None
 
 
 def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
@@ -2203,50 +2220,9 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
     `--force` restores the recorded content anyway.
     """
     force = getattr(args, "force", False)
-    entries = [e for e in read_changelog(tex) if e.get("kind") == "change"]
-    if args.turn:
-        current_turn = state.get("turn", 0)
-        # undo the current turn if it has changes, otherwise the most recent
-        # turn that does (the common case: user says "undo" after compile)
-        targets = [e for e in entries if e.get("turn", 0) == current_turn]
-        if not targets:
-            done = sorted({e.get("turn", 0) for e in entries})
-            if not done:
-                print("latex-draft: changelog is empty, nothing to undo",
-                      file=sys.stderr)
-                return 1
-            targets = [e for e in entries if e.get("turn", 0) == done[-1]]
-        # an undo already performed reverts its target; skip entries whose
-        # effect is already undone so `undo --turn` cannot loop
-        # every entry undone by the trailing run of undo commands is
-        # already reverted — skip all of them, not just the last one
-        undone_backups = set()
-        for e in reversed(read_changelog(tex)):
-            if e.get("kind") == "undo":
-                undone_backups.add(e.get("undid_backup"))
-            else:
-                break
-        if undone_backups:
-            targets = [
-                e for e in targets if e.get("backup") not in undone_backups
-            ]
-            if not targets:
-                print(
-                    f"latex-draft: turn {done[-1]} is already undone "
-                    "(last action was `undo`)"
-                )
-                return 0
-        n = len(targets)
-    else:
-        if not entries:
-            print("latex-draft: changelog is empty, nothing to undo",
-                  file=sys.stderr)
-            return 1
-        if args.n < 1:
-            print("latex-draft: --n must be >= 1", file=sys.stderr)
-            return 2
-        n = min(args.n, len(entries))
-        targets = entries[-n:]
+    targets, error = _undo_targets(tex, state, args)
+    if error is not None:
+        return error
     skipped: list[str] = []
     done_entries: list[dict] = []
     # replaying before-content is a whole-file restore, so undoing several
@@ -2256,7 +2232,7 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
     expected: dict[str, str] = {}
     for entry in reversed(targets):
         fname = entry.get("file", tex.name)
-        target = tex if fname == tex.name else tex.parent / fname
+        target = _file_of(tex, fname)
         try:
             current = read_tex(target)
         except (OSError, DraftError):
@@ -2296,10 +2272,8 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
                     "restoring recorded content anyway (--force)",
                     file=sys.stderr,
                 )
-        tmp = target.with_suffix(target.suffix + ".tmp")
         target.parent.mkdir(parents=True, exist_ok=True)
-        write_tex(tmp, entry["before"])
-        os.replace(tmp, target)
+        _atomic_write(target, entry["before"])
         done_entries.append(entry)
         expected[fname] = entry.get("before_sha256", "")
         append_changelog(
@@ -2351,7 +2325,7 @@ def cmd_backups(tex: Path, state: dict, args: argparse.Namespace) -> int:
         print("latex-draft: no backups")
         return 0
     for s in snaps:
-        note_file = s.with_suffix(s.suffix + ".note")
+        note_file = _note_path(s)
         note = note_file.read_text().strip() if note_file.exists() else ""
         mtime = datetime.fromtimestamp(s.stat().st_mtime).isoformat(timespec="seconds")
         print(f"{s.name}  {mtime}  {note}")
@@ -2435,7 +2409,7 @@ def cmd_check(tex: Path, state: dict, args: argparse.Namespace) -> int:
         for p in problems:
             print(f"  - {p}")
         return 1
-    print(f"latex-draft: check OK — no pending drafts, no stray markers, "
+    print("latex-draft: check OK — no pending drafts, no stray markers, "
           "no leftover preamble")
     return 0
 
