@@ -1,32 +1,77 @@
+---
+name: latex-draft
+description: >-
+  Turn-based, draft-marked editing of a LaTeX document from simple text input
+  (e.g. voice transcription). Drafts changes with the `changes` package so the
+  user inspects them in the compiled PDF before they are merged. Supports
+  Writer and Commenter modes, multi-file documents, changelog-based undo,
+  hand-edit detection, backups, and repair of failed compiles. Use when the
+  user wants to write, edit, review, or annotate a LaTeX paper by talking to
+  it.
+---
+
 # latex-draft — voice-to-LaTeX editing skill
 
 Edit a LaTeX document from simple text input (e.g. voice transcription),
 turn-based, with drafts that are visible in the compiled PDF before being
 merged.
 
+## Invocation (use exactly this form)
+
+Every tool call is:
+
+```sh
+python3 tools/latex_draft.py <main.tex> <command> [options]
+```
+
+`<main.tex>` is always the **main** file of the document (e.g.
+`paper.tex`), even when editing a chapter — use `--file` for that. In this
+guide, `latex-draft` is shorthand for `python3 tools/latex_draft.py <main.tex>`.
+(If you install the package with `pip install .`, the `latex-draft` command
+becomes available directly.)
+
 ## Modes (declare one at the start of the conversation)
 
 State the active mode in your first reply and stay in it unless the user
 switches. The mode is a promise about *how* you may use the tool.
+**Default: if the user has not picked a mode, act as Writer** (the common
+case for "write/edit my paper" requests); say which mode you assumed.
 
 - **Writer** — may use `draft-insert`, `draft-replace`, `draft-delete`
-  (and `draft-comment`). Responsible for actually writing the text.
-- **Commenter** — may use **only** `draft-comment`. Adds footnotes that mark,
+  (and `draft-comment`). Responsible for making the concrete formulation and
+  phrasing from the input of the user — crystallizing the ideas, so to
+  speak: turning rough spoken intent into precise, idiomatic scientific
+  prose.
+- **Commenter** — may use **only** `draft-comment`. Adds comments that mark,
   question, or annotate the text. Never inserts, replaces, or deletes body
   text, and never restructures sections. If a change would require editing
   the text, propose it in a comment instead ("suggest rewriting this
   sentence as ...") and let the user ask a Writer.
 
+The tool does not enforce the mode — it is a promise you make. Stay in it.
+
 ## Writer best practices (scientific writing)
 
 - **Default to several versions.** Unless the user asks for exactly one,
   draft 2–3 alternative wordings/structures (e.g. two `draft-replace` drafts
-  with different `--new`, or two inserts). Say which you recommend and why.
+  with different `--new`). Label them with `--author A`, `--author B`, ... so
+  each alternative gets a distinct color in the PDF and can be told apart.
+  Say which you recommend and why.
 - **Be critical; no unsubstantiated claims.** Do not draft claims that the
   document does not support (no invented results, citations, or superlatives
   like "state-of-the-art" / "novel" without evidence). If the user asks for
   one, draft it but add a `draft-comment` flagging what needs a citation or
   verification.
+- **Never invent `\cite` keys or bibliography entries.** If a claim needs a
+  reference and you do not know a real key, write `\cite{TODO}` plus a
+  `draft-comment` ("needs a real citation"). The session-end check validates
+  all references.
+- **Check `\ref`/`\eqref` targets exist** before drafting a reference to a
+  label that may not be there; if unsure, use `\ref{TODO}` plus a comment.
+  Do not touch equations (renumbering, reordering) unless the user asked.
+- **Confirm spoken math instead of guessing.** Dictated math is ambiguous
+  ("x squared plus y" vs "x to the y"); restate your reading and confirm
+  before drafting it.
 - **Push back.** If an instruction is factually wrong, inconsistent with the
   rest of the document, or would damage the argument, say so plainly *before*
   drafting, and offer the corrected alternative. Never silently comply.
@@ -34,30 +79,43 @@ switches. The mode is a promise about *how* you may use the tool.
   paper", "improve this"), do not draft anything — ask 2–4 concrete
   questions first (see "Clarify before acting").
 
+### Dictation conventions
+
+Expect these spoken commands and map them deliberately (confirm if unsure):
+"new paragraph" → blank line; "open quote"/"close quote" → ` `` ` / ` '' `;
+"backslash X" → `\X`; "section X" → `\section{X}`. Match the document's
+spelling variant (US/UK) unless the user says otherwise.
+
 ## The one tool this skill relies on
 
-`tools/latex_draft.py` (CLI: `python3 tools/latex_draft.py <file.tex> <command>`).
-It is the only supported way to modify `.tex` files. Never edit the document
-by hand; every change goes through the tool so it is marked, backed up and
-reversible.
+`tools/latex_draft.py`. It is the only supported way to modify `.tex` files.
+Never edit the document by hand; every change goes through the tool so it is
+marked, backed up and reversible.
 
 Drafts are wrapped in the LaTeX [`changes`](https://ctan.org/pkg/changes)
 package markup (`\added` / `\deleted`) plus `% latex-draft:<id>` marker
-comments. The document preamble is auto-augmented with
-`\usepackage[draft]{changes}`, so recompiling shows additions in green and
-deletions struck through — the user inspects the PDF and decides.
+comments. The main file's preamble is auto-augmented with
+`\usepackage[draft]{changes}` and a `\definechangesauthor` per author, so
+recompiling shows additions in the author's color and deletions struck
+through — the user inspects the PDF and decides.
 
 **Multi-file documents.** If the paper is stitched together from several
-files (`\input`/`\include` in the main file), pass `--file <name.tex>` to any
-`draft-*` command to draft directly into that part (e.g.
-`draft-insert --file chapter1.tex --after "..." --text "..."`). The file
-must be one of the main file's `\input`/`\include` dependencies —
-**discovered transitively**, so a chapter that itself `\input`s a subsection
-works too (`--file sub.tex`). Anchors are searched only within the target
-file, the `changes` package is only injected into the main file, and the
-changelog records which file each change touched. Everything else —
-accept/reject, undo, backups, hand-edit detection — works across all files
-of the document automatically. (`status` lists the detected input files.)
+files, pass `--file <name.tex>` to any `draft-*` command to draft directly
+into that part (e.g. `draft-insert --file chapter1.tex --after "..." --text "..."`).
+Input files are discovered **transitively** via `\input`, `\include`,
+`\subfile`, and `\import` — a chapter that itself `\input`s a subsection
+works too (`--file sub.tex`). Bibliography (`.bib`) files are *not* tracked
+or edited. Anchors are searched only within the target file, the `changes`
+package is only injected into the main file, and the changelog records which
+file each change touched. Everything else — accept/reject, undo, backups,
+hand-edit detection — works across all files of the document automatically.
+(`status` lists the detected input files.)
+
+**Anchors.** `--after`/`--before` match a substring of exactly one line;
+`--old` may span several lines but must occur exactly once (outside draft
+blocks). Keep **one sentence per line** in the source — anchoring into a
+paragraph that is one long line is awkward. If a match is not unique,
+re-read the file and use a longer anchor or `--at-line`.
 
 ## Clarify before acting (vague instructions)
 
@@ -81,8 +139,8 @@ When the instruction is vague:
 3. **Offer a concrete proposal** the user can approve with one word, e.g.
    "Say the word and I'll draft 2 versions of a 3-sentence motivation
    paragraph after the abstract."
-4. Only when the user's answer makes the request specific, start the turn
-   protocol below.
+4. Only when the user's answer makes the request specific, start the
+   conversation loop below.
 
 A request is specific enough when you can name: the exact text or location to
 change, what the new text should say (or the concrete options to draft), and
@@ -105,10 +163,10 @@ SESSION START ──► IDLE ──► TURN ──► REVIEW ──► RESOLVE �
 
 Run before the first edit:
 
-- `latex-draft <file> status` — takes the full initial backup on first use,
+- `latex-draft status` — takes the full initial backup on first use,
   confirms document state.
-- `latex-draft <file> backup --note "session start"` — explicit named
-  restore point (recommended when the file has no tool state yet).
+- `latex-draft backup --note "session start"` — explicit named restore point
+  (recommended when the file has no tool state yet).
 
 Allowed: `status`, `backup`. Nothing else is needed here.
 
@@ -125,45 +183,53 @@ The user sends an instruction. Decide first:
   "show my drafts")? → answer with read-only commands and stay in IDLE.
 
 Allowed in IDLE: read-only commands only — `status`, `list`, `changelog`,
-`backups` — plus reading the `.tex` file. **Never** `draft-*`, `accept`,
-`reject`, `undo`, or `compile` in IDLE.
+`backups`, `check` — plus reading the `.tex` files. **Never** `draft-*`,
+`accept`, `reject`, `undo`, `compile`, or `repair` in IDLE.
 
 ### State 2: TURN (drafting a change)
 
 One user request = one turn. Execute in this order:
 
 1. **Turn-start safety check.** The first tool call of the turn verifies
-   that the `.tex` file (and every `\input`/`\include` dependency) has not
+   that the `.tex` files (the main file and every input dependency) have not
    been edited by hand since the last turn. If the tool prints a `WARNING`,
    **read it carefully** and re-read the file (`status`, `changelog`,
    `cat`) before drafting — your anchors may have moved.
-2. **Read the document** (`cat` the `.tex` file) to find anchors.
+2. **Read the document** (`cat` the target `.tex` file) to find anchors.
 3. **Draft** the change. Always draft first; never write final text
    directly. (Mode rules apply: Writer may draft anything, Commenter only
    `draft-comment`.)
    - Insert: `latex-draft draft-insert --after "<unique line>" --text "..."`
-     (or `--before` / `--at-line N`; the anchor must match exactly one line
-     in the target file)
+     (or `--before` / `--at-line N`)
    - Replace: `latex-draft draft-replace --old "..." --new "..."`
-     (`--old` must occur exactly once outside draft blocks)
    - Delete: `latex-draft draft-delete --old "..."`
    - Comment (Commenter mode, or to flag something in Writer mode):
      `latex-draft draft-comment --after "<unique line>" --text "..."`
-   - All four accept `--file <name.tex>` to edit an `\input`/`\include`
-     part of a multi-file document instead of the main file.
+     Use `--margin` for a todonotes margin note when the anchor is inside a
+     caption, section title, table, or math (a footnote breaks there and
+     shifts pagination).
+   - All four accept `--file <name.tex>` (multi-file documents) and
+     `--author <label>` (distinct color per alternative; see best practices).
    - If the instruction is ambiguous (several options), draft **several
-     options** (Writer mode: this is the default, see best practices).
+     options** (Writer mode: this is the default).
 4. **Compile** (mandatory end of turn): `latex-draft compile`.
    The PDF viewer shows the updated PDF automatically. Compiling also ends
    the turn: it takes the per-turn backup and bumps the turn counter.
    **If the compile fails**, run `latex-draft repair` (see "Repair mode"
-   below), then compile again.
+   below) and compile again — **a turn must not end with a broken build**:
+   either fix it (repair or a corrective draft) or `undo` the change that
+   broke it, then compile successfully.
 5. **Report** draft ids and previews, and ask the user which to accept.
 
 Allowed in TURN: `draft-insert`, `draft-replace`, `draft-delete`,
 `draft-comment`, `compile`, `repair`, plus read-only commands (`list`,
-`status`, `changelog`). **Never** `accept`, `reject`, or `undo` in TURN —
-resolving happens in RESOLVE.
+`status`, `changelog`, `check`). **Never** `accept`, `reject`, or `undo`
+in TURN — resolving happens in RESOLVE.
+
+**Turns with no edits** (the user only asked a question, or you only read
+back text) make no tool changes and need **no `compile`** — compiling would
+bump the turn counter and take a backup for nothing. End such turns with a
+plain reply.
 
 ### State 3: REVIEW (the user looks at the PDF)
 
@@ -180,7 +246,9 @@ The user's message names which drafts to keep or discard. Execute:
    - keep → `latex-draft accept --id <id>` (or `accept --all`)
    - discard → `latex-draft reject --id <id>` (or `reject --all`)
 3. If the user asks to undo something instead: `latex-draft undo --n K` or
-   `latex-draft undo --turn`.
+   `latex-draft undo --turn`. Undo is **refuse-on-conflict**: a change is
+   skipped (with a warning) if the file changed after it; use `undo --force`
+   to restore the recorded content anyway.
 4. **Compile** (mandatory end of turn): `latex-draft compile`.
 5. Report what was merged/restored and return to IDLE.
 
@@ -189,57 +257,67 @@ Allowed in RESOLVE: `accept`, `reject`, `undo`, `compile`, `list`,
 while resolving, finish the resolution first (steps 1–4), then start a new
 TURN for the new request.
 
+### Comment lifecycle
+
+A `draft-comment` is a draft like any other: it appears as a footnote (or
+margin note with `--margin`) in the PDF, and is resolved the same way —
+`accept` keeps it (as a real footnote/margin note in the document),
+`reject` removes it (dismisses the comment). Accepted comments stay in the
+final document; run `latex-draft check` before submission and reject the
+comments you do not want to keep.
+
 ### Loop summary table
 
 | State | Trigger | Allowed tool commands | Forbidden |
 |---|---|---|---|
 | SESSION START | conversation begins | `status`, `backup` | everything else |
-| IDLE | user sends instruction | `status`, `list`, `changelog`, `backups` | `draft-*`, `accept`, `reject`, `undo`, `compile` |
+| IDLE | user sends instruction | `status`, `list`, `changelog`, `backups`, `check` | `draft-*`, `accept`, `reject`, `undo`, `compile`, `repair` |
 | TURN | specific editing request | `draft-*`, `compile`, `repair`, read-only | `accept`, `reject`, `undo` |
 | REVIEW | PDF is open for inspection | none (wait) | everything |
 | RESOLVE | user decides on drafts | `accept`, `reject`, `undo`, `compile`, `list`, `status` | `draft-*` |
 
-Every turn — TURN or RESOLVE — **must end with exactly one `compile`**.
-A turn that drafted but did not compile is an error: fix it by compiling
-before doing anything else.
+Every turn that changed something — TURN or RESOLVE — **must end with
+exactly one successful `compile`**. A turn that drafted but did not compile
+(or ended with a failed build) is an error: fix it by compiling before doing
+anything else.
 
 ## Command reference
 
 All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
-`<main.tex>` is always the **main** file of the document, even when editing
-a chapter (use `--file` for that).
 
 | Command | Purpose | Key options |
 |---|---|---|
-| `draft-insert` | draft inserting text at an anchor | `--after` / `--before` / `--at-line N` (exactly one), `--text`, `--file` |
-| `draft-replace` | draft replacing existing text | `--old` (unique), `--new`, `--file` |
-| `draft-delete` | draft deleting existing text | `--old` (unique), `--file` |
-| `draft-comment` | draft a footnote at an anchor (Commenter mode) | `--after` / `--before` / `--at-line N`, `--text`, `--file` |
+| `draft-insert` | draft inserting text at an anchor | `--after` / `--before` / `--at-line N` (exactly one), `--text`, `--file`, `--author` |
+| `draft-replace` | draft replacing existing text | `--old` (unique), `--new`, `--file`, `--author` |
+| `draft-delete` | draft deleting existing text | `--old` (unique), `--file`, `--author` |
+| `draft-comment` | draft a comment at an anchor (Commenter mode) | `--after` / `--before` / `--at-line N`, `--text`, `--file`, `--author`, `--margin` |
 | `list` | list drafts: id, status, op, preview | — |
 | `accept` | merge draft(s) into the file, removing markup | `--id <id>` or `--all` |
 | `reject` | discard draft(s), restoring original text | `--id <id>` or `--all` |
 | `compile` | recompile the PDF; ends the turn (per-turn backup) | — |
 | `repair` | after a failed compile: analyze the log, apply safe fixes as drafts, suggest the rest | — |
 | `backup` | take a manual snapshot | `--note "..."` |
-| `undo` | revert recorded changes | `--n K` or `--turn` |
+| `undo` | revert recorded changes (refuse-on-conflict) | `--n K` or `--turn`, `--force` |
 | `backups` | list snapshots | — |
 | `changelog` | show the change log | `--last N` |
 | `status` | summary: turn, drafts, changes, backups, pdf, inputs, warnings | — |
+| `check` | pre-submission check: no pending drafts, no stray markers, no leftover preamble | — |
 
-Exit codes: `0` success, `1` nothing to do / runtime failure, `2` usage error
-(unknown draft id, ambiguous anchor, text not found, file not an input).
+Exit codes: `0` success, `1` nothing to do / runtime failure / check failed,
+`2` usage error (unknown draft id, ambiguous anchor, text not found, file
+not an input).
 
 ## Repair mode (when `compile` fails)
 
-`latex-draft <file> repair` analyzes the last `.log` and:
+`latex-draft repair` analyzes the last `.log` and:
 
 - **Auto-fixes safely**, as normal *drafted* changes (marked with the
   `changes` package, backed up, changelogged, reviewable in the PDF — nothing
   is applied silently):
-  - `\begin{X} ended by \end{Y}` — corrects the wrong `\end{Y}` to `\end{X}`
-    (located in the main file or any `\input`/`\include` file).
-  - undefined `\added`/`\deleted`/`\footnote` with no `changes` package —
-    injects the preamble into the main file.
+  - a wrong `\end{Y}` from a `\begin{X}`/`\end{Y}` mismatch (located in the
+    main file or any input file);
+  - a missing `changes` preamble when a draft block uses
+    `\added`/`\deleted`/`\footnote`/`\todo`.
 - **Prints `SUGGESTION`s** for everything else — undefined control
   sequences (typo? missing `\usepackage`?), undefined environments, missing
   files, runaway arguments (unbalanced braces) — with the log line number.
@@ -248,23 +326,37 @@ Exit codes: `0` success, `1` nothing to do / runtime failure, `2` usage error
 After `repair`, treat its fixes like any other drafts: `list`, review in the
 PDF, `accept`/`reject`, then `compile`.
 
+## Pre-submission check (cleanup)
+
+Before the document leaves draft mode (submission, sharing, session end),
+run `latex-draft check`. It fails when:
+
+- drafts are still pending (accept or reject them first);
+- stray `% latex-draft:` markers remain in any file;
+- the auto-injected preamble (`\usepackage[draft]{changes}`,
+  `\definechangesauthor`, `\usepackage{todonotes}`) is left over after
+  everything was resolved — **this matters**: some classes (revtex, achemso)
+  reject the `changes` package in final mode. (The tool strips these
+  automatically when the last draft is resolved; `check` catches leftovers
+  from hand edits or crashes.)
+
 ## Change log and undo
 
 Every change the tool makes is appended to an append-only changelog
-(`<file.tex>.latex-draft-changes.jsonl`) with the full content before and
+(`<main.tex>.latex-draft-changes.jsonl`) with the full content before and
 after, so **any change can be undone individually** — even ones made turns
 ago — and the whole history is inspectable.
 
 - `latex-draft changelog [--last N]` — show the change log.
 - `latex-draft undo --n K` — revert the K most recent changes (replays the
-  recorded before-content).
+  recorded before-content; **refuse-on-conflict**, see RESOLVE).
 - `latex-draft undo --turn` — revert **all** changes of the current turn.
-- `latex-draft status` — summary; also warns if the file was edited by hand.
+- `latex-draft status` — summary; also warns if a file was edited by hand.
 
 ## Backups (automatic)
 
 - On **first use** on a file, a full initial backup is taken: the main file
-  plus every file it pulls in via `\input`/`\include` (kept forever).
+  plus every input file (kept forever).
 - A snapshot is taken before **every** mutation (draft, accept, reject) and
   **once per turn** when the turn ends with `compile`.
 - Retention: all snapshots < 1 h, one per hour for 24 h, one per day for 30 d
@@ -272,27 +364,26 @@ ago — and the whole history is inspectable.
 - `latex-draft backup --note "..."` — manual snapshot.
 - `latex-draft backups` — list snapshots.
 - Per-file state (draft ids, statuses, file hashes, turn counter) lives in
-  `<file.tex>.latex-draft.json`.
+  `<main.tex>.latex-draft.json`.
 
 ## Robustness against hand edits
 
-The user may edit the `.tex` file directly, even mid-turn:
+The user may edit the `.tex` files directly, even mid-turn:
 
 - **Between turns**: detected automatically at the start of the next tool
-  call (content hashes of the main file and its `\input`/`\include`
-  dependencies). The edit is recorded in the changelog as an `external`
-  entry, the new state is adopted, and the agent is warned to re-read the
-  file.
+  call (content hashes of the main file and all input dependencies). The
+  edit is recorded in the changelog as an `external` entry, the new state is
+  adopted, and the agent is warned to re-read the files.
 - **During a tool call**: a hash re-check happens immediately before every
-  write; if the file changed while the change was being prepared, the write
-  is **aborted** and the user's edit is never clobbered.
+  write; if a file changed while the change was being prepared, the write is
+  **aborted** and the user's edit is never clobbered.
 
 ## Session end (when the user is done editing)
 
 Before closing a session, finish with a **reference check**:
 
-1. `latex-draft <file> changelog` — review what changed this session. If any
-   turn added citations (`\cite{...}`, `\bibliography`, `\addbibresource`,
+1. `latex-draft changelog` — review what changed this session. If any turn
+   added citations (`\cite{...}`, `\bibliography`, `\addbibresource`,
    `thebibliography`), validate them:
 2. **Spawn a subagent** to check the validity of the references — every
    `\cite{key}` must have a matching bibliography entry, and every entry
@@ -302,8 +393,9 @@ Before closing a session, finish with a **reference check**:
 3. **If a subagent is unavailable, check yourself**: `grep` the `.tex`
    files for `\cite{...}` keys and for the corresponding
    `\bibitem{...}` entries / `.bib` keys, and compare the two sets.
-4. End the session with a final `latex-draft <file> compile` so the PDF is
-   up to date, and `latex-draft <file> status` to confirm a clean state.
+4. Run `latex-draft check` (clean pre-submission state), then a final
+   `latex-draft compile` so the PDF is up to date, and `latex-draft status`
+   to confirm.
 
 ## Rules
 
@@ -311,9 +403,8 @@ Before closing a session, finish with a **reference check**:
   tool → `compile`. Follow the state machine above: know your state
   (IDLE / TURN / REVIEW / RESOLVE) before every tool call and only use the
   commands that state allows.
-- Anchors (`--after`/`--before`/`--old`) must be unique in the file; if a
-  match is not unique, re-read the file and use a longer anchor or
-  `--at-line`.
+- Anchors (`--after`/`--before`/`--old`) must be unique in the target file;
+  keep one sentence per line in the source.
 - Keep drafted LaTeX idiomatic; escape `%`, `&`, `#`, `_` etc. as needed.
 - Do not commit backups, state files, changelogs, or build artifacts (see
   `.gitignore`).

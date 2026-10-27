@@ -34,15 +34,19 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-AUTHOR = "LLM"
+DEFAULT_AUTHOR = "LLM"
 CHANGES_PACKAGE = r"\usepackage[draft]{changes}"
-CHANGES_AUTHOR = rf"\definechangesauthor[name={AUTHOR}]{{{AUTHOR}}}"
+CHANGES_AUTHOR_RE = re.compile(r"\\definechangesauthor(\[[^\]]*\])?\{[^}]*\}")
+# colors from the changes package palette, cycled per non-default author
+AUTHOR_COLORS = ["blue", "orange", "purple", "brown", "teal", "magenta"]
 
 BLOCK_RE = re.compile(
     r"% latex-draft:([0-9a-f]{8})\n(.*?)% latex-draft-end:\1\n?", re.DOTALL
 )
 SNAP_RE = re.compile(r"^(\d{8})-(\d{6})-")
 INPUT_RE = re.compile(r"\\(?:input|include)(?:\[[^\]]*\])?\{([^}]+)\}")
+SUBFILE_RE = re.compile(r"\\subfile\{([^}]+)\}")
+IMPORT_RE = re.compile(r"\\import\{([^}]+)\}\{([^}]+)\}")
 
 
 class DraftError(Exception):
@@ -119,9 +123,16 @@ def tex_inputs(tex: Path) -> list[Path]:
             text = current.read_text(encoding="utf-8")
         except OSError:
             continue
+        names: list[tuple[Path, str]] = []
         for match in INPUT_RE.finditer(text):
-            name = match.group(1).strip()
-            candidate = current.parent / name
+            names.append((current.parent, match.group(1).strip()))
+        for match in SUBFILE_RE.finditer(text):
+            names.append((current.parent, match.group(1).strip()))
+        for match in IMPORT_RE.finditer(text):
+            # \import{dir}{file}: the file lives in dir, inputs relative to it
+            names.append((current.parent / match.group(1).strip(), match.group(2).strip()))
+        for base, name in names:
+            candidate = base / name
             if not candidate.suffix:
                 candidate = candidate.with_suffix(".tex")
             resolved = candidate.resolve()
@@ -335,33 +346,79 @@ def ensure_full_backup(tex: Path, state: dict) -> None:
 # ---------------------------------------------------------------- drafts
 
 
-def ensure_changes_package(text: str) -> str:
-    if re.search(r"\\usepackage(\[[^\]]*\])?\{changes\}", text):
-        return text
+def author_line(author: str, color: str | None = None) -> str:
+    if color:
+        return rf"\definechangesauthor[color={color},name={author}]{{{author}}}"
+    return rf"\definechangesauthor[name={author}]{{{author}}}"
+
+
+def ensure_changes_package(text: str, author: str = DEFAULT_AUTHOR) -> str:
+    """Inject \\usepackage[draft]{changes} plus a \\definechangesauthor for the
+    given author (colored when it is not the default, so alternatives are
+    distinguishable in the PDF). Idempotent."""
     lines = text.split("\n")
+    have_pkg = any(
+        re.search(r"\\usepackage(\[[^\]]*\])?\{changes\}", line) for line in lines
+    )
+    have_author = any(
+        re.search(rf"\\definechangesauthor(\[[^\]]*\])?\{{{re.escape(author)}}}", line)
+        for line in lines
+    )
+    if have_pkg and have_author:
+        return text
+    insert_at = 0
     for i, line in enumerate(lines):
         if line.startswith("\\documentclass"):
-            lines.insert(i + 1, CHANGES_PACKAGE)
-            lines.insert(i + 2, CHANGES_AUTHOR)
-            return "\n".join(lines)
-    return CHANGES_PACKAGE + "\n" + CHANGES_AUTHOR + "\n" + text
+            insert_at = i + 1
+            break
+    additions: list[str] = []
+    if not have_pkg:
+        additions.append(CHANGES_PACKAGE)
+    if not have_author:
+        additions.append(author_line(author, _author_color(text, author)))
+    lines[insert_at:insert_at] = additions
+    return "\n".join(lines)
 
 
-def build_block(did: str, old: str | None = None, new: str | None = None) -> str:
+def _author_color(text: str, author: str) -> str | None:
+    """A stable color per non-default author, based on how many other
+    non-default authors are already defined (cycles through the palette)."""
+    if author == DEFAULT_AUTHOR:
+        return None
+    others = [
+        m.group(1)
+        for m in re.finditer(
+            r"\\definechangesauthor(?:\[[^\]]*\])?\{([^}]+)\}", text
+        )
+        if m.group(1) != author
+    ]
+    return AUTHOR_COLORS[len(others) % len(AUTHOR_COLORS)]
+
+
+def build_block(
+    did: str,
+    old: str | None = None,
+    new: str | None = None,
+    author: str = DEFAULT_AUTHOR,
+) -> str:
     parts = [f"% latex-draft:{did}"]
     if old is not None:
-        parts.append(rf"\deleted[author={AUTHOR}]{{{old}}}")
+        parts.append(rf"\deleted[author={author}]{{{old}}}")
     if new is not None:
-        parts.append(rf"\added[author={AUTHOR}]{{{new}}}")
+        parts.append(rf"\added[author={author}]{{{new}}}")
     parts.append(f"% latex-draft-end:{did}")
     return "\n".join(parts)
 
 
-def build_comment_block(did: str, text: str) -> str:
-    """A commenter-mode draft: a footnote that never alters the body text."""
-    return "\n".join(
-        [f"% latex-draft:{did}", rf"\footnote{{{text}}}", f"% latex-draft-end:{did}"]
-    )
+def build_comment_block(did: str, text: str, margin: bool = False) -> str:
+    """A commenter-mode draft that never alters the body text.
+
+    Default is a footnote; with margin=True a todonotes margin note, which is
+    safe inside captions, section titles, tables and math (a footnote is not)
+    and does not shift pagination.
+    """
+    cmd = rf"\todo{{{text}}}" if margin else rf"\footnote{{{text}}}"
+    return "\n".join([f"% latex-draft:{did}", cmd, f"% latex-draft-end:{did}"])
 
 
 def insert_block(
@@ -387,7 +444,7 @@ def insert_block(
                     in_block = False
                 pos += 1
                 continue
-            if line in (CHANGES_PACKAGE, CHANGES_AUTHOR) or re.fullmatch(
+            if injected_preamble_line(line) or re.fullmatch(
                 r"% latex-draft:[0-9a-f]{8}", line
             ):
                 if re.fullmatch(r"% latex-draft:[0-9a-f]{8}", line):
@@ -403,7 +460,7 @@ def insert_block(
             default=-1,
         )
         pos = max(pos, dc + 1)
-        while pos < len(lines) and lines[pos] in (CHANGES_PACKAGE, CHANGES_AUTHOR):
+        while pos < len(lines) and injected_preamble_line(lines[pos]):
             pos += 1
     else:
         needle = after if after is not None else before
@@ -487,14 +544,26 @@ def extract_top_command_contents(block: str, cmd: str) -> list[str]:
     ]
 
 
+def injected_preamble_line(line: str) -> bool:
+    """Whether a preamble line was auto-injected by latex-draft (the changes
+    package in draft mode, or any \\definechangesauthor)."""
+    stripped = line.strip()
+    if stripped == CHANGES_PACKAGE:
+        return True
+    return bool(CHANGES_AUTHOR_RE.fullmatch(stripped))
+
+
 def strip_changes_package_if_unused(text: str) -> str:
-    """Remove the auto-injected preamble lines once no draft markers remain."""
+    """Remove the auto-injected preamble lines once no draft markers remain,
+    so the document is clean for submission (some classes reject the changes
+    package in final mode)."""
     if "% latex-draft:" in text:
         return text
     lines = [
         line
         for line in text.split("\n")
-        if line not in (CHANGES_PACKAGE, CHANGES_AUTHOR)
+        if not injected_preamble_line(line)
+        and not re.fullmatch(r"\\usepackage(\[[^\]]*\])?\{todonotes\}", line.strip())
     ]
     return "\n".join(lines)
 
@@ -567,12 +636,13 @@ def resolve_drafts(text: str, ids: set[str], accept: bool) -> tuple[str, set[str
             if content:
                 return content + ("\n" if had_nl else "")
             return ""
-        content = extract_command_content(m.group(2), "footnote")
-        if content is not None:
-            if not accept:
-                return ""
-            out = rf"\footnote{{{content}}}"
-            return out + ("\n" if had_nl else "")
+        for cmd in ("footnote", "todo"):
+            content = extract_command_content(m.group(2), cmd)
+            if content is not None:
+                if not accept:
+                    return ""
+                out = rf"\{cmd}{{{content}}}"
+                return out + ("\n" if had_nl else "")
         return ""
 
     return BLOCK_RE.subn(repl, text)[0], found
@@ -626,23 +696,17 @@ def mutate(tex: Path, state: dict, note: str, fn, target: Path | None = None) ->
 
 def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
     did = new_id(state)
+    author = getattr(args, "author", None) or DEFAULT_AUTHOR
     target = resolve_target(tex, getattr(args, "file", None))
     if target is None:
         return 2
 
     def fn(text: str) -> str:
-        if target != tex:
-            return insert_block(
-                text,
-                build_block(did, new=args.text),
-                after=args.after,
-                before=args.before,
-                at_line=args.at_line,
-            )
-        text = ensure_changes_package(text)
+        if target == tex:
+            text = ensure_changes_package(text, author)
         return insert_block(
             text,
-            build_block(did, new=args.text),
+            build_block(did, new=args.text, author=author),
             after=args.after,
             before=args.before,
             at_line=args.at_line,
@@ -655,6 +719,7 @@ def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
         return 2
     state["drafts"][did] = draft_record(did, "insert", args.text)
     state["drafts"][did]["file"] = target.name
+    state["drafts"][did]["author"] = author
     save_state(tex, state)
     print(f"latex-draft: drafted insert {did} in {target.name}")
     return 0
@@ -690,6 +755,7 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
     did = new_id(state)
     old = args.old
     new = getattr(args, "new", None)
+    author = getattr(args, "author", None) or DEFAULT_AUTHOR
     target = resolve_target(tex, getattr(args, "file", None))
     if target is None:
         return 2
@@ -697,12 +763,12 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
 
     def fn(text: str) -> str:
         if target == tex:
-            text = ensure_changes_package(text)
+            text = ensure_changes_package(text, author)
         # Draft over the visible occurrence of the old text. If a pending
         # draft already replaced it, the visible text no longer contains it;
         # draft over the original inside the outermost pending draft block.
         if text.count(old) == 1:
-            return text.replace(old, build_block(did, old=old, new=new))
+            return text.replace(old, build_block(did, old=old, new=new, author=author))
         matches = list(BLOCK_RE.finditer(text))
         # innermost pending block containing the old text (a block drafted
         # over an already-drafted replacement nests inside the outer block)
@@ -715,7 +781,9 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
                 "--old text matched 0 times (not in the document, not in any "
                 "pending draft block)"
             )
-        inner = host.group(2).replace(old, build_block(did, old=old, new=new), 1)
+        inner = host.group(2).replace(
+            old, build_block(did, old=old, new=new, author=author), 1
+        )
         return text[: host.start(2)] + inner + text[host.end(2) :]
 
     visible = BLOCK_RE.sub("", text)
@@ -741,6 +809,7 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
     preview = new if op == "replace" else old
     state["drafts"][did] = draft_record(did, op, preview)
     state["drafts"][did]["file"] = target.name
+    state["drafts"][did]["author"] = author
     save_state(tex, state)
     print(f"latex-draft: drafted {op} {did} in {target.name}")
     return 0
@@ -756,16 +825,20 @@ def cmd_draft_delete(tex: Path, state: dict, args: argparse.Namespace) -> int:
 
 def cmd_draft_comment(tex: Path, state: dict, args: argparse.Namespace) -> int:
     did = new_id(state)
+    author = getattr(args, "author", None) or DEFAULT_AUTHOR
+    margin = getattr(args, "margin", False)
     target = resolve_target(tex, getattr(args, "file", None))
     if target is None:
         return 2
 
     def fn(text: str) -> str:
         if target == tex:
-            text = ensure_changes_package(text)
+            text = ensure_changes_package(text, author)
+            if margin:
+                text = ensure_todonotes_package(text)
         return insert_block(
             text,
-            build_comment_block(did, args.text),
+            build_comment_block(did, args.text, margin=margin),
             after=args.after,
             before=args.before,
             at_line=args.at_line,
@@ -778,9 +851,23 @@ def cmd_draft_comment(tex: Path, state: dict, args: argparse.Namespace) -> int:
         return 2
     state["drafts"][did] = draft_record(did, "comment", args.text)
     state["drafts"][did]["file"] = target.name
+    state["drafts"][did]["author"] = author
+    state["drafts"][did]["margin"] = margin
     save_state(tex, state)
     print(f"latex-draft: drafted comment {did} in {target.name}")
     return 0
+
+
+def ensure_todonotes_package(text: str) -> str:
+    """Inject \\usepackage{todonotes} if missing (for margin-note comments)."""
+    if re.search(r"\\usepackage(\[[^\]]*\])?\{todonotes\}", text):
+        return text
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line.startswith("\\documentclass"):
+            lines.insert(i + 1, r"\usepackage{todonotes}")
+            return "\n".join(lines)
+    return r"\usepackage{todonotes}" + "\n" + text
 
 
 def cmd_list(tex: Path, state: dict, args: argparse.Namespace) -> int:
@@ -1078,7 +1165,7 @@ def cmd_repair(tex: Path, state: dict, args: argparse.Namespace) -> int:
                 continue
             suggestions.append(f"fix the mismatched \\end{{{p['end']}}} by hand")
         elif p["kind"] == "undefined-control" and p.get("command") in (
-            "added", "deleted", "footnote",
+            "added", "deleted", "footnote", "todo",
         ):
             text = tex.read_text(encoding="utf-8")
             if "changes" not in text:
@@ -1145,12 +1232,18 @@ def cmd_backup(tex: Path, state: dict, args: argparse.Namespace) -> int:
 
 
 def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
-    """Undo changes using the changelog.
+    r"""Undo changes using the changelog.
 
     `undo --n K` reverts the K most recent changes by replaying their
     recorded before-content. `undo --turn` reverts every change made in the
     current turn (the turn is ended by `compile`, which bumps the counter).
+
+    Undo is refuse-on-conflict: if a file no longer matches the state after
+    the change being undone (because of later edits or hand edits), that
+    change is skipped with a warning instead of overwriting newer work.
+    `--force` restores the recorded content anyway.
     """
+    force = getattr(args, "force", False)
     entries = [e for e in read_changelog(tex) if e.get("kind") == "change"]
     if args.turn:
         current_turn = state.get("turn", 0)
@@ -1187,20 +1280,39 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
             return 1
         n = max(1, min(args.n, len(entries)))
         targets = entries[-n:]
+    skipped: list[str] = []
+    done_entries: list[dict] = []
+    # replaying before-content is a whole-file restore, so undoing several
+    # changes only works back-to-back without intervening edits: track the
+    # expected content as we go (each undone change must match the
+    # before-state of the change undone right after it)
+    expected: dict[str, str] = {}
     for entry in reversed(targets):
         fname = entry.get("file", tex.name)
         target = tex if fname == tex.name else tex.parent / fname
         current = target.read_text(encoding="utf-8")
-        if sha256(current) != entry.get("after_sha256"):
+        want = expected.get(fname, entry.get("after_sha256"))
+        if sha256(current) != want:
+            if not force:
+                skipped.append(fname)
+                print(
+                    f"latex-draft: skipped '{entry.get('note', '?')}' in "
+                    f"{fname}: the file changed after it (conflict); "
+                    "use --force to restore the recorded content anyway",
+                    file=sys.stderr,
+                )
+                continue
             print(
                 f"latex-draft: WARNING: {fname} no longer matches the "
                 f"state after '{entry.get('note', '?')}' (hand edits?); "
-                "restoring recorded content anyway",
+                "restoring recorded content anyway (--force)",
                 file=sys.stderr,
             )
         tmp = target.with_suffix(target.suffix + ".tmp")
         tmp.write_text(entry["before"], encoding="utf-8")
         os.replace(tmp, target)
+        done_entries.append(entry)
+        expected[fname] = entry.get("before_sha256", "")
         append_changelog(
             tex,
             {
@@ -1215,9 +1327,16 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
         )
     state["file_hashes"] = current_hashes(tex)
     save_state(tex, state)
-    what = f"turn {state.get('turn', 0)}" if args.turn else f"{n} change(s)"
-    files = sorted({e.get("file", tex.name) for e in targets})
-    print(f"latex-draft: undid {what}; restored {', '.join(files)}")
+    if not done_entries:
+        print("latex-draft: nothing undone (all changes conflicted)",
+              file=sys.stderr)
+        return 1
+    what = f"turn {state.get('turn', 0)}" if args.turn else f"{len(done_entries)} change(s)"
+    files = sorted({e.get("file", tex.name) for e in done_entries})
+    msg = f"latex-draft: undid {what}; restored {', '.join(files)}"
+    if skipped:
+        msg += f"; skipped {len(skipped)} conflicting change(s)"
+    print(msg)
     return 0
 
 
@@ -1271,6 +1390,56 @@ def cmd_status(tex: Path, state: dict, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check(tex: Path, state: dict, args: argparse.Namespace) -> int:
+    """Pre-submission check: the document must be clean of draft markup.
+
+    Reports, across the main file and all input files:
+    - pending drafts (must be accepted or rejected first)
+    - stray `% latex-draft:` markers (a draft block the tool no longer knows)
+    - leftover auto-injected preamble lines (changes/todonotes packages and
+      \\definechangesauthor) once nothing is pending — some classes (revtex,
+      achemso) reject them in final mode
+    Exit code is 0 when clean, 1 when problems were found.
+    """
+    problems: list[str] = []
+    pending = [
+        did for did, rec in state["drafts"].items() if rec["status"] == "pending"
+    ]
+    if pending:
+        problems.append(
+            f"{len(pending)} pending draft(s): {', '.join(sorted(pending))} "
+            "(accept or reject them first)"
+        )
+    for f in watched_files(tex):
+        try:
+            text = f.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        stray = len(re.findall(r"% latex-draft(-end)?:[0-9a-f]{8}", text))
+        if stray:
+            problems.append(f"{f.name}: {stray} stray latex-draft marker line(s)")
+    if not pending:
+        main_text = tex.read_text(encoding="utf-8")
+        leftovers = [
+            line.strip()
+            for line in main_text.split("\n")
+            if injected_preamble_line(line)
+        ]
+        if leftovers:
+            problems.append(
+                f"{tex.name}: leftover auto-injected preamble line(s): "
+                + "; ".join(leftovers)
+            )
+    if problems:
+        print(f"latex-draft: check FAILED ({len(problems)} problem(s)):")
+        for p in problems:
+            print(f"  - {p}")
+        return 1
+    print(f"latex-draft: check OK — no pending drafts, no stray markers, "
+          "no leftover preamble")
+    return 0
+
+
 HANDLERS = {
     "draft-insert": cmd_draft_insert,
     "draft-replace": cmd_draft_replace,
@@ -1286,6 +1455,7 @@ HANDLERS = {
     "backups": cmd_backups,
     "changelog": cmd_changelog,
     "status": cmd_status,
+    "check": cmd_check,
 }
 
 
@@ -1304,8 +1474,17 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument(
             "--file",
             default=None,
-            help="edit this \\input/\\include file of the document instead of "
-            "the main file (path relative to the main file)",
+            help="edit this \\input/\\include/\\subfile/\\import file of the "
+            "document instead of the main file (path relative to the main file)",
+        )
+
+    def add_author_option(p, parser):
+        parser.add_argument(
+            "--author",
+            default=None,
+            help="changes-package author label for this draft (default: LLM); "
+            "non-default authors get a distinct color so alternatives are "
+            "distinguishable in the PDF",
         )
 
     p = sub.add_parser("draft-insert", help="insert a drafted text at an anchor")
@@ -1315,19 +1494,22 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--at-line", type=int, help="1-based line number to insert before")
     p.add_argument("--text", required=True, help="LaTeX text to insert (drafted)")
     add_file_option(p, p)
+    add_author_option(p, p)
 
     p = sub.add_parser("draft-replace", help="draft replacing existing text")
     p.add_argument("--old", required=True, help="text to replace (must occur exactly once)")
     p.add_argument("--new", required=True, help="replacement LaTeX text")
     add_file_option(p, p)
+    add_author_option(p, p)
 
     p = sub.add_parser("draft-delete", help="draft deleting existing text")
     p.add_argument("--old", required=True, help="text to delete (must occur exactly once)")
     add_file_option(p, p)
+    add_author_option(p, p)
 
     p = sub.add_parser(
         "draft-comment",
-        help="commenter mode: add a drafted footnote at an anchor "
+        help="commenter mode: add a drafted comment at an anchor "
         "(never alters the body text)",
     )
     g = p.add_mutually_exclusive_group(required=True)
@@ -1335,7 +1517,14 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--before", help="unique line content to attach the comment to")
     g.add_argument("--at-line", type=int, help="1-based line number to attach to")
     p.add_argument("--text", required=True, help="LaTeX comment text")
+    p.add_argument(
+        "--margin",
+        action="store_true",
+        help="use a todonotes margin note instead of a footnote (safe inside "
+        "captions, section titles, tables and math; no pagination shift)",
+    )
     add_file_option(p, p)
+    add_author_option(p, p)
 
     sub.add_parser("list", help="list drafts and their status")
 
@@ -1365,6 +1554,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--turn", action="store_true", help="undo all changes of the current turn"
     )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="restore recorded content even when the file changed after the "
+        "change (default: refuse on conflict)",
+    )
 
     sub.add_parser("backups", help="list backup snapshots")
 
@@ -1372,6 +1567,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--last", type=int, default=20, help="show only the last N entries")
 
     sub.add_parser("status", help="show document, draft and backup status")
+
+    sub.add_parser(
+        "check",
+        help="pre-submission check: no pending drafts, no stray markers, "
+        "no leftover changes/todonotes preamble",
+    )
     return parser
 
 

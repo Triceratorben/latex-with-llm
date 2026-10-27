@@ -782,6 +782,198 @@ class TestNestedFiles(LatexDraftCase):
         self.assertEqual(entries[-1]["file"], "sub.tex")
 
 
+class TestAuthorLabeling(LatexDraftCase):
+    def test_alternatives_get_distinct_authors_and_colors(self):
+        self.run_cli(
+            "draft-replace",
+            "--author",
+            "A",
+            "--old",
+            "Small problems are worth studying.",
+            "--new",
+            "Version A.",
+        )
+        self.run_cli(
+            "draft-replace",
+            "--author",
+            "B",
+            "--old",
+            "Small problems are worth studying.",
+            "--new",
+            "Version B.",
+        )
+        text = self.tex.read_text()
+        self.assertIn(r"\added[author=A]{Version A.}", text)
+        self.assertIn(r"\added[author=B]{Version B.}", text)
+        self.assertIn(r"\definechangesauthor[color=blue,name=A]{A}", text)
+        self.assertIn(r"\definechangesauthor[color=orange,name=B]{B}", text)
+        # draft records carry the author
+        self.assertEqual(
+            sorted(rec["author"] for rec in self.state()["drafts"].values()),
+            ["A", "B"],
+        )
+
+    def test_ensure_changes_package_idempotent_per_author(self):
+        from tools.latex_draft import ensure_changes_package
+
+        once = ensure_changes_package(PAPER, "A")
+        twice = ensure_changes_package(once, "A")
+        self.assertEqual(once, twice)
+        with_b = ensure_changes_package(once, "B")
+        self.assertIn(r"\definechangesauthor[color=orange,name=B]{B}", with_b)
+
+    def test_strip_removes_all_author_lines(self):
+        from tools.latex_draft import ensure_changes_package, strip_changes_package_if_unused
+
+        text = ensure_changes_package(PAPER, "A")
+        text = ensure_changes_package(text, "B")
+        stripped = strip_changes_package_if_unused(text)
+        self.assertNotIn("definechangesauthor", stripped)
+        self.assertNotIn("usepackage[draft]{changes}", stripped)
+        self.assertEqual(stripped, PAPER)
+
+
+class TestMarginComments(LatexDraftCase):
+    def test_margin_comment_uses_todo(self):
+        rc = self.run_cli(
+            "draft-comment",
+            "--margin",
+            "--after",
+            "Small problems are worth studying.",
+            "--text",
+            "Check this.",
+        )
+        self.assertEqual(rc, 0)
+        text = self.tex.read_text()
+        self.assertIn(r"\todo{Check this.}", text)
+        self.assertIn(r"\usepackage{todonotes}", text)
+        self.assertNotIn(r"\footnote", text)
+
+    def test_accept_margin_comment_keeps_todo(self):
+        self.run_cli(
+            "draft-comment",
+            "--margin",
+            "--after",
+            "Small problems are worth studying.",
+            "--text",
+            "Check this.",
+        )
+        did = self.draft_ids()[0]
+        self.run_cli("accept", "--id", did)
+        self.assertIn(r"\todo{Check this.}", self.tex.read_text())
+        self.assertNotIn("latex-draft:", self.tex.read_text())
+
+    def test_reject_margin_comment_removes_it(self):
+        original = self.tex.read_text()
+        self.run_cli(
+            "draft-comment",
+            "--margin",
+            "--after",
+            "Small problems are worth studying.",
+            "--text",
+            "Check this.",
+        )
+        did = self.draft_ids()[0]
+        self.run_cli("reject", "--id", did)
+        self.assertEqual(self.tex.read_text(), original)
+
+
+class TestUndoConflict(LatexDraftCase):
+    def test_undo_refuses_on_conflict(self):
+        # a hand edit (adopted at the next command start) changes the file
+        # after a change was recorded
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
+        self.tex.write_text(self.tex.read_text() + "\n% hand edit\n")
+        self.run_cli("status")  # turn start: adopts the hand edit
+        # undoing the recorded change now conflicts: the file no longer
+        # matches its recorded after-state -> refuse instead of clobbering
+        rc = self.run_cli("undo")
+        self.assertEqual(rc, 1)
+        self.assertIn("% hand edit", self.tex.read_text())
+        # --force restores the recorded content anyway
+        rc = self.run_cli("undo", "--force")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("% hand edit", self.tex.read_text())
+
+    def test_undo_back_to_back_reverts_all(self):
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "two.")
+        original = PAPER
+        rc = self.run_cli("undo", "--n", "2")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.tex.read_text(), original)
+
+    def test_undo_force_restores_anyway(self):
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "two.")
+        rc = self.run_cli("undo", "--n", "2", "--force")
+        self.assertEqual(rc, 0)
+        text = self.tex.read_text()
+        # both changes reverted, original restored
+        self.assertNotIn("one.", text)
+        self.assertNotIn("two.", text)
+
+    def test_undo_all_conflicting_fails(self):
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
+        # hand edit after the change (adopted at next command start)
+        self.tex.write_text(self.tex.read_text() + "\n% hand edit\n")
+        self.run_cli("status")
+        rc = self.run_cli("undo")
+        self.assertEqual(rc, 1)
+
+
+class TestCheck(LatexDraftCase):
+    def test_check_ok_when_clean(self):
+        self.assertEqual(self.run_cli("check"), 0)
+
+    def test_check_fails_with_pending_draft(self):
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
+        self.assertEqual(self.run_cli("check"), 1)
+
+    def test_check_fails_with_stray_marker(self):
+        self.tex.write_text(self.tex.read_text() + "\n% latex-draft:deadbeef\n")
+        self.assertEqual(self.run_cli("check"), 1)
+
+    def test_check_fails_with_leftover_preamble(self):
+        # simulate a leftover injected preamble with no pending drafts
+        from tools.latex_draft import ensure_changes_package
+
+        self.tex.write_text(ensure_changes_package(PAPER))
+        self.assertEqual(self.run_cli("check"), 1)
+
+    def test_check_ok_after_resolving_all(self):
+        self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
+        self.run_cli("accept", "--all")
+        self.assertEqual(self.run_cli("check"), 0)
+
+
+class TestExtendedInputs(LatexDraftCase):
+    def test_subfile_discovered(self):
+        sub = self.dir / "sub.tex"
+        sub.write_text("\\section{Sub}\n")
+        self.tex.write_text(PAPER.replace("\\end{document}", "\\subfile{sub}\n\\end{document}"))
+        from tools.latex_draft import tex_inputs
+
+        self.assertEqual([d.name for d in tex_inputs(self.tex)], ["sub.tex"])
+        rc = self.run_cli(
+            "draft-insert", "--file", "sub.tex", "--at-line", "1", "--text", "x."
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("latex-draft:", sub.read_text())
+
+    def test_import_discovered(self):
+        chapter_dir = self.dir / "chapters"
+        chapter_dir.mkdir()
+        ch = chapter_dir / "one.tex"
+        ch.write_text("\\section{One}\n")
+        self.tex.write_text(
+            PAPER.replace("\\end{document}", "\\import{chapters/}{one}\n\\end{document}")
+        )
+        from tools.latex_draft import tex_inputs
+
+        self.assertEqual([d.name for d in tex_inputs(self.tex)], ["one.tex"])
+
+
 class TestCompileAndStatus(LatexDraftCase):
     def test_compile_without_engine_warns_but_succeeds(self):
         # latexmk/pdflatex are not installed in this environment

@@ -19,10 +19,20 @@ change is aborted, never clobbered).
 
 **Multi-file papers** (a `paper.tex` stitched together from chapters) are
 fully supported: pass `--file chapter1.tex` to any `draft-*` command to edit
-that part directly. Input files are discovered **transitively**, so nested
-structures (`paper.tex` → `chapter1.tex` → `sub.tex`) work the same way.
-Anchors are matched within the target file, drafts are resolved per file,
-and undo/changelog/hand-edit detection span the whole document.
+that part directly. Input files are discovered **transitively** via
+`\input`/`\include`/`\subfile`/`\import`, so nested structures
+(`paper.tex` → `chapter1.tex` → `sub.tex`) work the same way. Anchors are
+matched within the target file, drafts are resolved per file, and
+undo/changelog/hand-edit detection span the whole document.
+
+**Alternatives are distinguishable**: pass `--author A`, `--author B`, ...
+when drafting several versions — each author gets a distinct color in the
+PDF. **Comments** default to footnotes; use `draft-comment --margin` for a
+todonotes margin note inside captions, titles, tables, or math. **`undo` is
+refuse-on-conflict** (a change is skipped if the file changed after it;
+`--force` overrides). **`latex-draft <file> check`** is the pre-submission
+check: no pending drafts, no stray `latex-draft:` markers, and no leftover
+auto-injected preamble (which some classes reject in final mode).
 
 The skill has two modes, declared at the start of a conversation (see
 `SKILL.md`): **Writer** (drafts actual text changes) and **Commenter** (only
@@ -93,22 +103,24 @@ All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
 
 | Command | Purpose | Key options |
 |---|---|---|
-| `draft-insert` | draft inserting text at an anchor | `--after` / `--before` / `--at-line N` (exactly one), `--text`, `--file` |
-| `draft-replace` | draft replacing existing text | `--old` (unique), `--new`, `--file` |
-| `draft-delete` | draft deleting existing text | `--old` (unique), `--file` |
-| `draft-comment` | draft a footnote at an anchor (Commenter mode) | `--after` / `--before` / `--at-line N`, `--text`, `--file` |
+| `draft-insert` | draft inserting text at an anchor | `--after` / `--before` / `--at-line N` (exactly one), `--text`, `--file`, `--author` |
+| `draft-replace` | draft replacing existing text | `--old` (unique), `--new`, `--file`, `--author` |
+| `draft-delete` | draft deleting existing text | `--old` (unique), `--file`, `--author` |
+| `draft-comment` | draft a comment at an anchor (Commenter mode) | `--after` / `--before` / `--at-line N`, `--text`, `--file`, `--author`, `--margin` |
 | `list` | list drafts: id, status, op, preview | — |
 | `accept` | merge draft(s) into the file, removing markup | `--id <id>` or `--all` |
 | `reject` | discard draft(s), restoring original text | `--id <id>` or `--all` |
 | `compile` | recompile the PDF; ends the turn (per-turn backup) | — |
 | `repair` | after a failed compile: analyze the log, apply safe fixes as drafts, suggest the rest | — |
 | `backup` | take a manual snapshot | `--note "..."` |
-| `undo` | revert recorded changes | `--n K` or `--turn` |
+| `undo` | revert recorded changes (refuse-on-conflict) | `--n K` or `--turn`, `--force` |
 | `backups` | list snapshots | — |
 | `changelog` | show the change log | `--last N` |
 | `status` | summary: turn, drafts, changes, backups, pdf, inputs, warnings | — |
+| `check` | pre-submission check: no pending drafts, no stray markers, no leftover preamble | — |
 
-Exit codes: `0` success, `1` nothing to do / runtime failure, `2` usage error
-(unknown draft id, ambiguous anchor, text not found, file not an input).
+Exit codes: `0` success, `1` nothing to do / runtime failure / check failed,
+`2` usage error (unknown draft id, ambiguous anchor, text not found, file
+not an input).
 See `SKILL.md` for the full guide: modes, the conversation state machine,
 and the per-state command rules.
