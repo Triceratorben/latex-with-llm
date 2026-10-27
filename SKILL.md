@@ -37,16 +37,17 @@ switches. The mode is a promise about *how* you may use the tool.
 **Default: if the user has not picked a mode, act as Writer** (the common
 case for "write/edit my paper" requests); say which mode you assumed.
 
-- **Writer** — may use `draft-insert`, `draft-replace`, `draft-delete`
-  (and `draft-comment`). Responsible for making the concrete formulation and
-  phrasing from the input of the user — crystallizing the ideas, so to
-  speak: turning rough spoken intent into precise, idiomatic scientific
-  prose.
+- **Writer** — may use `draft-insert`, `draft-replace`, `draft-delete`,
+  `draft-preamble` (and `draft-comment`). Responsible for making the
+  concrete formulation and phrasing from the input of the user —
+  crystallizing the ideas, so to speak: turning rough spoken intent into
+  precise, idiomatic scientific prose.
 - **Commenter** — may use **only** `draft-comment`. Adds comments that mark,
   question, or annotate the text. Never inserts, replaces, or deletes body
-  text, and never restructures sections. If a change would require editing
-  the text, propose it in a comment instead ("suggest rewriting this
-  sentence as ...") and let the user ask a Writer.
+  text, never restructures sections, and never changes the preamble
+  (`draft-preamble` is a Writer capability). If a change would require
+  editing the text or the preamble, propose it in a comment instead
+  ("suggest rewriting this sentence as ...") and let the user ask a Writer.
 
 The tool does not enforce the mode — it is a promise you make. Stay in it.
 
@@ -232,8 +233,19 @@ One user request = one turn. Execute in this order:
      Use `--margin` for a todonotes margin note when the anchor is inside a
      caption, section title, table, or math (a footnote breaks there and
      shifts pagination).
-   - All four accept `--file <name.tex>` (multi-file documents) and
-     `--author <label>` (distinct color per alternative; see best practices).
+   - Preamble change (Writer mode): `latex-draft draft-preamble --text "..."`
+     with exactly one of `--start` (after `\documentclass`), `--end` (before
+     `\begin{document}`), or `--after "<unique preamble line>"`. Use it for
+     preamble-only commands: `\renewcommand{\thesection}{\Roman{section}}`,
+     `\setlength`, `\captionsetup`, font/geometry changes. These cannot go
+     through `\added`/`\deleted` (the changes package typesets immediately,
+     expands with `\protected@edef`, and opens a group — all wrong in a
+     preamble), so a preamble draft is raw LaTeX between the markers. It
+     compiles live, so the user sees the effect (e.g. Roman numeral
+     headings) in the PDF; `accept` merges it verbatim, `reject` removes it.
+   - All four body-text drafts accept `--file <name.tex>` (multi-file
+     documents) and `--author <label>` (distinct color per alternative; see
+     best practices). `draft-preamble` always edits the main file.
    - If the instruction is ambiguous (several options), draft **several
      options** (Writer mode: this is the default).
 4. **Compile** (mandatory end of turn): `latex-draft compile`.
@@ -246,9 +258,9 @@ One user request = one turn. Execute in this order:
 5. **Report** draft ids and previews, and ask the user which to accept.
 
 Allowed in TURN: `draft-insert`, `draft-replace`, `draft-delete`,
-`draft-comment`, `compile`, `repair`, plus read-only commands (`list`,
-`status`, `changelog`, `check`). **Never** `accept`, `reject`, or `undo`
-in TURN — resolving happens in RESOLVE.
+`draft-preamble`, `draft-comment`, `compile`, `repair`, plus read-only
+commands (`list`, `status`, `changelog`, `check`). **Never** `accept`,
+`reject`, or `undo` in TURN — resolving happens in RESOLVE.
 
 **Turns with no edits** (the user only asked a question, or you only read
 back text) make no tool changes and need **no `compile`** — compiling would
@@ -315,6 +327,7 @@ All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
 | `draft-replace` | draft replacing existing text | `--old` (unique), `--new`, `--file`, `--author` |
 | `draft-delete` | draft deleting existing text | `--old` (unique), `--file`, `--author` |
 | `draft-comment` | draft a comment at an anchor (Commenter mode) | `--after` / `--before` / `--at-line N`, `--text`, `--file`, `--author`, `--margin` |
+| `draft-preamble` | draft a preamble change (raw LaTeX, not changes-marked; for `\renewcommand`, `\setlength`, `\captionsetup`, font/geometry) | `--start` / `--end` / `--after <unique preamble line>` (exactly one), `--text` |
 | `list` | list drafts: id, status, op, preview | — |
 | `accept` | merge draft(s) into the file, removing markup | `--id <id>` or `--all` |
 | `reject` | discard draft(s), restoring original text | `--id <id>` or `--all` |

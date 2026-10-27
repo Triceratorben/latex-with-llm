@@ -460,6 +460,31 @@ def build_comment_block(did: str, text: str, margin: bool = False) -> str:
     return "\n".join([f"% latex-draft:{did}", cmd, f"% latex-draft-end:{did}"])
 
 
+def build_preamble_block(did: str, text: str) -> str:
+    """A preamble draft block: raw LaTeX between marker comments, NOT
+    wrapped in \\added/\\deleted.
+
+    Preamble commands (\\renewcommand, \\setlength, \\captionsetup, ...)
+    cannot go through the changes package: \\added typesets its argument
+    immediately (\"Missing \\begin{document}\" in the preamble), expands it
+    with \\protected@edef (freezing counter references like \\Roman{section}
+    at definition time), and opens a group (so body-level \\def is discarded).
+    The raw text is still marked, backed up, changelogged, and tracked as a
+    draft — accepting merges it verbatim, rejecting removes it. The PDF
+    review shows the effect (e.g. Roman numeral section headings).
+    """
+    return "\n".join([f"% latex-draft:{did}", text, f"% latex-draft-end:{did}"])
+
+
+def find_preamble_end(text: str) -> int:
+    """Line index (0-based) of \\begin{document} — the end of the preamble.
+    Raises DraftError when the document has no \\begin{document}."""
+    for i, line in enumerate(text.split("\n")):
+        if line.strip().startswith("\\begin{document}"):
+            return i
+    raise DraftError("no \\begin{document} found — cannot locate the preamble")
+
+
 def insert_block(
     text: str,
     block: str,
@@ -633,6 +658,14 @@ def resolve_drafts(text: str, ids: set[str], accept: bool) -> tuple[str, set[str
         # Re-attach the newline only when the following text does not start
         # with one, so a reject restores the original line structure.
         had_nl = m.group(0).endswith("\n")
+        # A preamble draft block: raw text between the markers, no
+        # \\added/\\deleted. The block occupies whole lines, so reject
+        # removes the match entirely (like a pure insert draft); accept
+        # merges the raw text verbatim, keeping the end-marker's newline.
+        if not re.search(r"\\(added|deleted|footnote|todo)\b", m.group(2)):
+            if not accept:
+                return ""
+            return m.group(2).strip("\n") + ("\n" if had_nl else "")
         content = extract_command_content(m.group(2), "added" if accept else "deleted")
         if content is not None:
             deleted = extract_command_content(m.group(2), "deleted")
@@ -913,6 +946,75 @@ def ensure_todonotes_package(text: str) -> str:
         )
     lines.insert(insert_at, r"\usepackage{todonotes}")
     return "\n".join(lines)
+
+
+def cmd_draft_preamble(tex: Path, state: dict, args: argparse.Namespace) -> int:
+    r"""Draft a preamble change: raw LaTeX inserted into the preamble of the
+    main file, between marker comments but NOT wrapped in \added/\deleted.
+
+    Preamble commands (\renewcommand, \setlength, \captionsetup, font or
+    geometry changes, ...) cannot go through the changes package: \added
+    typesets its argument immediately ("Missing \begin{document}" in the
+    preamble), expands it with \protected@edef (freezing counter references
+    like \Roman{section} at definition time), and opens a group (so
+    body-level \def is discarded). The raw text is still marked, backed up,
+    changelogged, and tracked as a draft — accepting merges it verbatim,
+    rejecting removes it. The PDF review shows the effect (e.g. Roman numeral
+    section headings).
+    """
+    did = new_id(state)
+    position = args.position
+    text_arg = args.text
+
+    def fn(text: str) -> str:
+        lines = text.split("\n")
+        bd = find_preamble_end(text)
+        if position == "start":
+            pos = 0
+            for i, line in enumerate(lines):
+                if line.startswith("\\documentclass"):
+                    pos = i + 1
+                    break
+        elif position == "end":
+            pos = bd
+        else:
+            # Search preamble lines only (before \begin{document}), skipping
+            # lines inside pending draft blocks: an anchor must refer to a
+            # line of the user's own preamble.
+            hits = []
+            in_block = False
+            for i, line in enumerate(lines):
+                if i >= bd:
+                    break
+                if re.fullmatch(r"% latex-draft:[0-9a-f]{8}", line):
+                    in_block = True
+                if in_block:
+                    if re.fullmatch(r"% latex-draft-end:[0-9a-f]{8}", line):
+                        in_block = False
+                    continue
+                if position in line:
+                    hits.append(i)
+            if len(hits) != 1:
+                raise DraftError(
+                    f"anchor {position!r} matched {len(hits)} preamble lines "
+                    "(need exactly 1)"
+                )
+            pos = hits[0] + 1
+        block_lines = build_preamble_block(did, text_arg).split("\n")
+        lines[pos:pos] = block_lines
+        return "\n".join(lines)
+
+    try:
+        mutate(tex, state, f"draft preamble {did}", fn)
+    except DraftError as e:
+        print(f"latex-draft: {e}", file=sys.stderr)
+        return 2
+    state["drafts"][did] = draft_record(did, "preamble", text_arg)
+    state["drafts"][did]["file"] = tex.name
+    state["drafts"][did]["preamble"] = True
+    save_state(tex, state)
+    print(f"latex-draft: drafted preamble change {did} in {tex.name}")
+    return 0
 
 
 def cmd_list(tex: Path, state: dict, args: argparse.Namespace) -> int:
@@ -1566,6 +1668,7 @@ HANDLERS = {
     "draft-replace": cmd_draft_replace,
     "draft-delete": cmd_draft_delete,
     "draft-comment": cmd_draft_comment,
+    "draft-preamble": cmd_draft_preamble,
     "list": cmd_list,
     "accept": cmd_accept,
     "reject": cmd_reject,
@@ -1647,6 +1750,33 @@ def build_parser() -> argparse.ArgumentParser:
     add_file_option(p, p)
     add_author_option(p, p)
 
+    p = sub.add_parser(
+        "draft-preamble",
+        help="draft a preamble change (raw LaTeX, not changes-marked; "
+        "for \\renewcommand, \\setlength, \\captionsetup, font/geometry, ...)",
+    )
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument(
+        "--start",
+        action="store_const",
+        const="start",
+        dest="position",
+        help="insert right after \\documentclass (start of preamble)",
+    )
+    g.add_argument(
+        "--end",
+        action="store_const",
+        const="end",
+        dest="position",
+        help="insert right before \\begin{document} (end of preamble)",
+    )
+    g.add_argument(
+        "--after",
+        dest="position",
+        help="unique preamble line content to insert after",
+    )
+    p.add_argument("--text", required=True, help="LaTeX preamble code to insert (drafted)")
+
     sub.add_parser("list", help="list drafts and their status")
 
     for name, help_text in [
@@ -1714,6 +1844,7 @@ def main(argv: list[str] | None = None) -> int:
         "draft-replace",
         "draft-delete",
         "draft-comment",
+        "draft-preamble",
         "accept",
         "reject",
         "undo",

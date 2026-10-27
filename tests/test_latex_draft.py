@@ -1273,5 +1273,161 @@ class TestMultiParagraphDrafts(LatexDraftCase):
         self.assertEqual(text.count(r"\added[id=LLM]{"), 1)
 
 
+class TestDraftPreamble(LatexDraftCase):
+    r"""Preamble drafts: raw LaTeX between markers, NOT wrapped in
+    \added/\deleted (the changes package cannot typeset in the preamble).
+    Accept merges verbatim, reject removes byte-identically."""
+
+    def test_end_position_raw_text_no_changes_package(self):
+        rc = self.run_cli(
+            "draft-preamble",
+            "--end",
+            "--text",
+            r"\renewcommand{\thesection}{\Roman{section}}",
+        )
+        self.assertEqual(rc, 0)
+        text = self.tex.read_text()
+        did = self.draft_ids()[0]
+        self.assertIn(f"% latex-draft:{did}\n", text)
+        self.assertIn(r"\renewcommand{\thesection}{\Roman{section}}", text)
+        self.assertIn(f"% latex-draft-end:{did}", text)
+        # raw text: no changes-package markup, and the package is NOT injected
+        self.assertNotIn(r"\added", text)
+        self.assertNotIn(r"\deleted", text)
+        self.assertNotIn("changes", text)
+        self.assertEqual(self.state()["drafts"][did]["op"], "preamble")
+        self.assertTrue(self.state()["drafts"][did]["preamble"])
+        # the raw text sits before \begin{document}
+        self.assertLess(
+            text.index(r"\renewcommand{\thesection}"),
+            text.index("\\begin{document}"),
+        )
+
+    def test_start_position_after_documentclass(self):
+        rc = self.run_cli(
+            "draft-preamble", "--start", "--text", r"\usepackage{amsmath}"
+        )
+        self.assertEqual(rc, 0)
+        text = self.tex.read_text()
+        self.assertLess(
+            text.index("\\documentclass"),
+            text.index(r"\usepackage{amsmath}"),
+        )
+        self.assertLess(
+            text.index(r"\usepackage{amsmath}"), text.index("\\title")
+        )
+
+    def test_after_anchor_preamble_line(self):
+        rc = self.run_cli(
+            "draft-preamble", "--after", "\\title{A Small Paper}", "--text", r"\setlength{\parskip}{1em}"
+        )
+        self.assertEqual(rc, 0)
+        text = self.tex.read_text()
+        self.assertLess(
+            text.index("\\title{A Small Paper}"),
+            text.index(r"\setlength{\parskip}{1em}"),
+        )
+        self.assertLess(
+            text.index(r"\setlength{\parskip}{1em}"),
+            text.index("\\begin{document}"),
+        )
+
+    def test_anchor_searches_preamble_only(self):
+        # The anchor text also appears in the body; only the preamble
+        # occurrence may count.
+        self.tex.write_text(
+            "\\documentclass{article}\n"
+            "\\usepackage{geometry}\n"
+            "\\begin{document}\n"
+            "\\usepackage{geometry}\n"
+            "\\end{document}\n"
+        )
+        rc = self.run_cli(
+            "draft-preamble", "--after", "\\usepackage{geometry}", "--text", "X"
+        )
+        self.assertEqual(rc, 0)
+        text = self.tex.read_text()
+        lines = text.split("\n")
+        self.assertEqual(lines[1], "\\usepackage{geometry}")
+        self.assertIn("% latex-draft:", lines[2])
+
+    def test_ambiguous_anchor_fails(self):
+        self.tex.write_text(
+            "\\documentclass{article}\n"
+            "\\usepackage{amsmath}\n"
+            "\\usepackage{amsmath}\n"
+            "\\begin{document}\n"
+            "x\n"
+            "\\end{document}\n"
+        )
+        original = self.tex.read_text()
+        rc = self.run_cli(
+            "draft-preamble", "--after", "\\usepackage{amsmath}", "--text", "X"
+        )
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.tex.read_text(), original)
+        self.assertEqual(self.draft_ids(), [])
+
+    def test_anchor_skips_pending_draft_blocks(self):
+        self.run_cli("draft-preamble", "--end", "--text", r"\captionsetup{font=small}")
+        original = self.tex.read_text()
+        # The anchored text exists only inside the pending draft block.
+        rc = self.run_cli(
+            "draft-preamble", "--after", r"\captionsetup{font=small}", "--text", "X"
+        )
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.tex.read_text(), original)
+
+    def test_accept_merges_verbatim(self):
+        rc = self.run_cli(
+            "draft-preamble",
+            "--end",
+            "--text",
+            r"\renewcommand{\thesection}{\Roman{section}}",
+        )
+        self.assertEqual(rc, 0)
+        did = self.draft_ids()[0]
+        self.run_cli("accept", "--id", did)
+        text = self.tex.read_text()
+        self.assertIn(r"\renewcommand{\thesection}{\Roman{section}}", text)
+        self.assertNotIn("latex-draft:", text)
+        self.assertEqual(self.run_cli("check"), 0)
+
+    def test_reject_removes_byte_identical(self):
+        original = self.tex.read_text()
+        self.run_cli(
+            "draft-preamble", "--end", "--text", r"\setlength{\parskip}{1em}"
+        )
+        did = self.draft_ids()[0]
+        self.run_cli("reject", "--id", did)
+        self.assertEqual(self.tex.read_text(), original)
+
+    def test_reject_all_byte_identical(self):
+        original = self.tex.read_text()
+        self.run_cli("draft-preamble", "--start", "--text", r"\usepackage{amsmath}")
+        self.run_cli("draft-preamble", "--end", "--text", r"\setlength{\parskip}{1em}")
+        self.run_cli("reject", "--all")
+        self.assertEqual(self.tex.read_text(), original)
+
+    def test_multi_line_text_preserved_verbatim(self):
+        text_arg = r"\setlength{\parskip}{1em}" + "\n" + r"\setlength{\parindent}{0pt}"
+        self.run_cli("draft-preamble", "--end", "--text", text_arg)
+        did = self.draft_ids()[0]
+        self.run_cli("accept", "--id", did)
+        text = self.tex.read_text()
+        self.assertIn(text_arg, text)
+        self.assertNotIn("latex-draft:", text)
+
+    def test_requires_position(self):
+        with self.assertRaises(SystemExit):
+            self.run_cli("draft-preamble", "--text", "x")
+
+    def test_no_begin_document_fails(self):
+        self.tex.write_text("\\documentclass{article}\nno document env\n")
+        rc = self.run_cli("draft-preamble", "--end", "--text", "x")
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.draft_ids(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
