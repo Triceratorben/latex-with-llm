@@ -59,6 +59,12 @@ class DraftError(Exception):
     pass
 
 
+def _fail(message: object, rc: int = 2) -> int:
+    """Report a user-facing error on stderr and return the exit code."""
+    print(f"latex-draft: {message}", file=sys.stderr)
+    return rc
+
+
 # ---------------------------------------------------------------- state
 
 
@@ -513,7 +519,7 @@ def snapshot(
     shutil.copy2(tex, dest)
     deps = tex_inputs(tex) if full else list(files or [])
     for dep in deps:
-        if not dep.is_file() or dep.resolve() == tex.resolve():
+        if not dep.is_file() or _same_file(dep, tex):
             continue
         shutil.copy2(dep, bdir / f"{dest.stem}__{_dep_copy_name(tex, dep)}")
     if note:
@@ -748,6 +754,24 @@ def split_paragraphs(text: str) -> list[str]:
     commands, invalid inside one).
     """
     return re.split(r"\n[ \t]*\n", text)
+
+
+def _prepare_body_text(
+    text: str, state: dict, author: str, margin: bool = False
+) -> str:
+    """Add the changes package (and todonotes) to a main file's preamble.
+
+    The injected lines are recorded in the state, so the strip at resolve time
+    removes exactly those and never a line the user wrote. `margin` also
+    loads todonotes, for a margin-note comment.
+    """
+    prepared = ensure_changes_package(text, author)
+    _record_injected(state, text, prepared)
+    if margin:
+        with_todo = ensure_todonotes_package(prepared)
+        _record_injected(state, prepared, with_todo)
+        prepared = with_todo
+    return prepared
 
 
 def _marker_block(did: str, body: str) -> str:
@@ -1142,6 +1166,19 @@ def _file_of(tex: Path, fname: str) -> Path:
     return tex if fname == tex.name else tex.parent / fname
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    """Whether two paths name the same file (the main file is resolved once)."""
+    return a.resolve() == b.resolve()
+
+
+def _blocks_by_id(text: str) -> dict[str, re.Match]:
+    """The draft blocks in `text`, first block per draft id."""
+    blocks: dict[str, re.Match] = {}
+    for m in BLOCK_RE.finditer(text):
+        blocks.setdefault(m.group(1), m)
+    return blocks
+
+
 def draft_record(did: str, op: str, preview_text: str) -> dict:
     preview = " ".join(preview_text.split())[:120]
     return {
@@ -1164,7 +1201,7 @@ def mutate(tex: Path, state: dict, note: str, fn, target: Path | None = None) ->
     target = target or tex
     before_text = read_tex(target)
     snap = snapshot(
-        tex, note, files=[target] if target.resolve() != tex.resolve() else None
+        tex, note, files=None if _same_file(target, tex) else [target]
     )
     new_text = fn(before_text)
     assert_no_external_change(tex, state)
@@ -1197,7 +1234,7 @@ def _validate_target(fn, target: Path, tex: Path) -> str | None:
     leaves the preamble of the main file modified. The main file needs no
     dry run — its preamble injection and the block are written in one step.
     """
-    if target.resolve() == tex.resolve():
+    if _same_file(target, tex):
         return None
     try:
         fn(read_tex(target))
@@ -1227,15 +1264,13 @@ def _apply_draft(
     """
     error = _validate_target(fn, target, tex)
     if error:
-        print(f"latex-draft: {error}", file=sys.stderr)
-        return 2
-    if target.resolve() != tex.resolve():
+        return _fail(error)
+    if not _same_file(target, tex):
         ensure_document_preamble(tex, state, author, margin=preamble_margin)
     try:
         mutate(tex, state, f"draft {op} {did}", fn, target=target)
     except DraftError as e:
-        print(f"latex-draft: {e}", file=sys.stderr)
-        return 2
+        return _fail(e)
     record = draft_record(did, op, preview)
     record.update({"file": target.name, "author": author, **(fields or {})})
     state["drafts"][did] = record
@@ -1244,7 +1279,20 @@ def _apply_draft(
     return 0
 
 
-def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
+def _insert_draft(
+    tex: Path,
+    state: dict,
+    args: argparse.Namespace,
+    op: str,
+    make_block,
+    margin: bool = False,
+    fields: dict | None = None,
+) -> int:
+    """Place a drafted block at an anchor: insert and comment share this.
+
+    They differ only in the block they build (and a margin comment also needs
+    todonotes in the preamble).
+    """
     did = new_id(state)
     author = getattr(args, "author", None) or DEFAULT_AUTHOR
     target = resolve_target(tex, getattr(args, "file", None))
@@ -1252,19 +1300,27 @@ def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
         return 2
 
     def fn(text: str) -> str:
-        if target == tex:
-            injected = ensure_changes_package(text, author)
-            _record_injected(state, text, injected)
-            text = injected
+        if _same_file(target, tex):
+            text = _prepare_body_text(text, state, author, margin)
         return insert_block(
             text,
-            block_for(text, build_block(did, new=args.text, author=author)),
+            block_for(text, make_block(did, author)),
             after=args.after,
             before=args.before,
             at_line=args.at_line,
         )
 
-    return _apply_draft(tex, state, target, fn, did, "insert", args.text, author)
+    return _apply_draft(
+        tex, state, target, fn, did, op, args.text, author,
+        preamble_margin=margin, fields=fields,
+    )
+
+
+def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
+    return _insert_draft(
+        tex, state, args, "insert",
+        lambda did, author: build_block(did, new=args.text, author=author),
+    )
 
 
 def resolve_target(tex: Path, file_arg: str | None) -> Path | None:
@@ -1280,7 +1336,7 @@ def resolve_target(tex: Path, file_arg: str | None) -> Path | None:
     if not candidate.is_file():
         print(f"latex-draft: no such file: {candidate}", file=sys.stderr)
         return None
-    if candidate == tex:
+    if _same_file(candidate, tex):
         return tex
     deps = {d.resolve() for d in tex_inputs(tex)}
     if candidate not in deps:
@@ -1353,10 +1409,8 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
         return removed.replace(old, "" if new is None else new, 1)
 
     def fn(text: str) -> str:
-        if target == tex:
-            injected = ensure_changes_package(text, author)
-            _record_injected(state, text, injected)
-            text = injected
+        if _same_file(target, tex):
+            text = _prepare_body_text(text, state, author)
         # Draft over the visible occurrence of the old text. If a pending
         # draft already replaced it, draft an *alternative* as a sibling
         # block right after the existing one — not nested inside it: the
@@ -1449,33 +1503,11 @@ def cmd_draft_delete(tex: Path, state: dict, args: argparse.Namespace) -> int:
 
 
 def cmd_draft_comment(tex: Path, state: dict, args: argparse.Namespace) -> int:
-    did = new_id(state)
-    author = getattr(args, "author", None) or DEFAULT_AUTHOR
     margin = getattr(args, "margin", False)
-    target = resolve_target(tex, getattr(args, "file", None))
-    if target is None:
-        return 2
-
-    def fn(text: str) -> str:
-        if target == tex:
-            injected = ensure_changes_package(text, author)
-            _record_injected(state, text, injected)
-            text = injected
-            if margin:
-                injected = ensure_todonotes_package(text)
-                _record_injected(state, text, injected)
-                text = injected
-        return insert_block(
-            text,
-            block_for(text, build_comment_block(did, args.text, margin=margin)),
-            after=args.after,
-            before=args.before,
-            at_line=args.at_line,
-        )
-
-    return _apply_draft(
-        tex, state, target, fn, did, "comment", args.text, author,
-        preamble_margin=margin, fields={"margin": margin},
+    return _insert_draft(
+        tex, state, args, "comment",
+        lambda did, author: build_comment_block(did, args.text, margin=margin),
+        margin=margin, fields={"margin": margin},
     )
 
 
@@ -1547,17 +1579,10 @@ def cmd_draft_preamble(tex: Path, state: dict, args: argparse.Namespace) -> int:
         block = block_for(text, build_preamble_block(did, text_arg))
         return insert_lines_at(text, pos, split_lines(block))
 
-    try:
-        mutate(tex, state, f"draft preamble {did}", fn)
-    except DraftError as e:
-        print(f"latex-draft: {e}", file=sys.stderr)
-        return 2
-    state["drafts"][did] = draft_record(did, "preamble", text_arg)
-    state["drafts"][did]["file"] = tex.name
-    state["drafts"][did]["preamble"] = True
-    save_state(tex, state)
-    print(f"latex-draft: drafted preamble change {did} in {tex.name}")
-    return 0
+    return _apply_draft(
+        tex, state, tex, fn, did, "preamble", text_arg, DEFAULT_AUTHOR,
+        fields={"preamble": True},
+    )
 
 
 def cmd_list(tex: Path, state: dict, args: argparse.Namespace) -> int:
@@ -1583,13 +1608,15 @@ def _sibling_ids(
     """
     siblings: set[str] = set()
     for fname, file_ids in by_file.items():
-        blocks = list(BLOCK_RE.finditer(read_tex(_file_of(tex, fname))))
+        blocks = _blocks_by_id(read_tex(_file_of(tex, fname)))
         accepted_old: set[str] = set()
-        for m in blocks:
-            if m.group(1) in file_ids:
-                deleted = extract_command_content(m.group(2), "deleted")
-                if deleted is not None:
-                    accepted_old.add(deleted)
+        for did in file_ids:
+            block = blocks.get(did)
+            if block is None:
+                continue
+            deleted = extract_command_content(block.group(2), "deleted")
+            if deleted is not None:
+                accepted_old.add(deleted)
         for did, rec in state["drafts"].items():
             if (
                 did in ids
@@ -1597,13 +1624,12 @@ def _sibling_ids(
                 or rec.get("file", tex.name) != fname
             ):
                 continue
-            for m in blocks:
-                if m.group(1) != did:
-                    continue
-                deleted = extract_command_content(m.group(2), "deleted")
-                if deleted is not None and deleted in accepted_old:
-                    siblings.add(did)
-                break
+            block = blocks.get(did)
+            if block is None:
+                continue
+            deleted = extract_command_content(block.group(2), "deleted")
+            if deleted is not None and deleted in accepted_old:
+                siblings.add(did)
     return siblings
 
 
@@ -1622,11 +1648,7 @@ def _close_missing_blocks(
             file_text = read_tex(_file_of(tex, fname))
         except (OSError, DraftError):
             file_text = ""
-        gone = [
-            did
-            for did in file_ids
-            if not any(m.group(1) == did for m in BLOCK_RE.finditer(file_text))
-        ]
+        gone = [did for did in file_ids if did not in _blocks_by_id(file_text)]
         if gone:
             missing[fname] = gone
     if not missing:
@@ -1748,15 +1770,14 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
                 raise DraftError(
                     f"draft(s) not found in {fname}: " + ", ".join(sorted(missing))
                 )
-            if target == tex and not others_pending:
+            if _same_file(target, tex) and not others_pending:
                 return strip_changes_package_if_unused(new_text, injected)
             return new_text
 
         try:
             mutate(tex, state, f"{verb} {','.join(file_ids)}", fn, target=target)
         except DraftError as e:
-            print(f"latex-draft: {e}", file=sys.stderr)
-            return 2
+            return _fail(e)
     # On accept, exactly one sibling per shared deleted span performs the
     # splice — that is the alternative whose text lands in the document.
     # The others are orphaned by the overlap. (On reject the first block of
@@ -2051,20 +2072,17 @@ def cmd_repair(tex: Path, state: dict, args: argparse.Namespace) -> int:
                 continue
             suggestions.append(f"fix the mismatched \\end{{{p['end']}}} by hand")
         elif p["kind"] == "undefined-control" and p.get("command") in (
-            "added", "deleted", "todo",
+            "added", "deleted", "todo", "definechangesauthor",
         ):
-            # A changes-package command without the package: inject the
-            # preamble into the main file (included files cannot carry it).
-            def _inject_preamble(text: str) -> str:
-                injected = ensure_changes_package(text)
-                _record_injected(state, text, injected)
-                return injected
-
+            # A changes-package command without the package (a draft block in
+            # a document that lost the preamble, or an author definition
+            # above the package load): inject the preamble into the main file
+            # — included files cannot carry it.
             mutate(
                 tex,
                 state,
                 "repair: inject changes package preamble",
-                _inject_preamble,
+                lambda text: _prepare_body_text(text, state, DEFAULT_AUTHOR),
             )
             fixed += 1
             continue
@@ -2077,24 +2095,6 @@ def cmd_repair(tex: Path, state: dict, args: argparse.Namespace) -> int:
                 "context, e.g. inside a caption or a section title); move it "
                 "or use a margin note (draft-comment --margin)"
             )
-        elif p["kind"] == "undefined-control" and p.get("command") in (
-            "definechangesauthor",
-        ):
-            # An author definition before the changes package: move the
-            # package load above it.
-            def _inject_preamble_before_author(text: str) -> str:
-                injected = ensure_changes_package(text)
-                _record_injected(state, text, injected)
-                return injected
-
-            mutate(
-                tex,
-                state,
-                "repair: load changes package before \\definechangesauthor",
-                _inject_preamble_before_author,
-            )
-            fixed += 1
-            continue
         elif p["kind"] == "undefined-control":
             suggestions.append(
                 f"undefined \\{p.get('command', '?')} (log line {p.get('line', '?')}): "
@@ -2160,7 +2160,7 @@ def _reconcile_draft_status(tex: Path, state: dict) -> None:
             text = read_tex(_file_of(tex, rec.get("file", tex.name)))
         except (OSError, DraftError):
             continue
-        has_block = any(m.group(1) == did for m in BLOCK_RE.finditer(text))
+        has_block = did in _blocks_by_id(text)
         if has_block and rec["status"] != "pending":
             rec["status"] = "pending"
             rec.pop("resolved", None)
@@ -2599,8 +2599,7 @@ def main(argv: list[str] | None = None) -> int:
         check_and_adopt_external(tex, state)
         rc = HANDLERS[args.command](tex, state, args)
     except DraftError as e:
-        print(f"latex-draft: {e}", file=sys.stderr)
-        return 2
+        return _fail(e)
     if rc == 0 and args.command in (
         "draft-insert",
         "draft-replace",
