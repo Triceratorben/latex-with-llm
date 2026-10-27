@@ -107,19 +107,29 @@ def sha256(text: str) -> str:
 
 
 def tex_inputs(tex: Path) -> list[Path]:
-    """Files pulled in via \\input/\\include (relative to the main file)."""
+    """Files pulled in via \\input/\\include, resolved transitively (a chapter
+    that itself \\input's a subsection is followed), relative to the main
+    file. Cycles are tolerated."""
     deps: list[Path] = []
-    try:
-        text = tex.read_text(encoding="utf-8")
-    except OSError:
-        return deps
-    for match in INPUT_RE.finditer(text):
-        name = match.group(1).strip()
-        candidate = tex.parent / name
-        if not candidate.suffix:
-            candidate = candidate.with_suffix(".tex")
-        if candidate.is_file() and candidate.resolve() != tex.resolve():
+    seen: set[Path] = {tex.resolve()}
+    queue = [tex]
+    while queue:
+        current = queue.pop(0)
+        try:
+            text = current.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for match in INPUT_RE.finditer(text):
+            name = match.group(1).strip()
+            candidate = current.parent / name
+            if not candidate.suffix:
+                candidate = candidate.with_suffix(".tex")
+            resolved = candidate.resolve()
+            if not candidate.is_file() or resolved in seen:
+                continue
+            seen.add(resolved)
             deps.append(candidate)
+            queue.append(candidate)
     return deps
 
 

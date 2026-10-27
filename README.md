@@ -19,9 +19,10 @@ change is aborted, never clobbered).
 
 **Multi-file papers** (a `paper.tex` stitched together from chapters) are
 fully supported: pass `--file chapter1.tex` to any `draft-*` command to edit
-that part directly. Anchors are matched within the target file, drafts are
-resolved per file, and undo/changelog/hand-edit detection span the whole
-document.
+that part directly. Input files are discovered **transitively**, so nested
+structures (`paper.tex` → `chapter1.tex` → `sub.tex`) work the same way.
+Anchors are matched within the target file, drafts are resolved per file,
+and undo/changelog/hand-edit detection span the whole document.
 
 The skill has two modes, declared at the start of a conversation (see
 `SKILL.md`): **Writer** (drafts actual text changes) and **Commenter** (only

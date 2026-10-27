@@ -669,6 +669,119 @@ class TestMultiFile(LatexDraftCase):
         self.assertNotIn("usepackage[draft]{changes}", self.tex.read_text())
 
 
+class TestNestedFiles(LatexDraftCase):
+    """Nested documents: paper.tex -> chapter1.tex -> sub.tex."""
+
+    def setUp(self):
+        super().setUp()
+        self.sub = self.dir / "sub.tex"
+        self.sub.write_text("\\section{Sub}\nSub body.\n")
+        self.chapter = self.dir / "chapter1.tex"
+        self.chapter.write_text(
+            "\\section{One}\nChapter body.\n\\input{sub}\n"
+        )
+        self.tex.write_text(
+            PAPER.replace(
+                "\\end{document}", "\\input{chapter1}\n\\end{document}"
+            )
+        )
+
+    def run_cli(self, *argv):
+        return main([str(self.tex), *argv])
+
+    def test_inputs_discovered_transitively(self):
+        from tools.latex_draft import tex_inputs
+
+        self.assertEqual(
+            [d.name for d in tex_inputs(self.tex)], ["chapter1.tex", "sub.tex"]
+        )
+
+    def test_status_lists_nested_inputs(self):
+        self.run_cli("status")
+        from tools.latex_draft import tex_inputs
+
+        self.assertIn("sub.tex", [d.name for d in tex_inputs(self.tex)])
+
+    def test_full_backup_includes_nested_inputs(self):
+        self.run_cli("list")  # first use triggers the full initial backup
+        snaps = list_snapshots(self.tex)
+        self.assertEqual(len(snaps), 1)
+        bdir = self.dir / ".latex-draft-backups" / self.tex.name
+        deps = sorted(
+            d.name.split("__", 1)[1] for d in bdir.glob(f"{snaps[0].stem}__*.tex")
+        )
+        self.assertEqual(deps, ["chapter1.tex", "sub.tex"])
+
+    def test_draft_into_nested_file(self):
+        rc = self.run_cli(
+            "draft-insert",
+            "--file",
+            "sub.tex",
+            "--after",
+            "Sub body.",
+            "--text",
+            "Nested draft.",
+        )
+        self.assertEqual(rc, 0)
+        sub = self.sub.read_text()
+        self.assertIn("latex-draft:", sub)
+        self.assertIn(r"\added[author=LLM]{Nested draft.}", sub)
+        did = self.draft_ids()[0]
+        self.assertEqual(self.state()["drafts"][did]["file"], "sub.tex")
+        # intermediate and main files untouched
+        self.assertNotIn("latex-draft:", self.chapter.read_text())
+        self.assertNotIn("latex-draft:", self.tex.read_text())
+
+    def test_accept_and_undo_in_nested_file(self):
+        original = self.sub.read_text()
+        self.run_cli(
+            "draft-replace",
+            "--file",
+            "sub.tex",
+            "--old",
+            "Sub body.",
+            "--new",
+            "Rewritten sub body.",
+        )
+        did = self.draft_ids()[0]
+        self.run_cli("accept", "--id", did)
+        self.assertIn("Rewritten sub body.", self.sub.read_text())
+        self.run_cli("undo", "--n", "2")  # undo the accept and the draft
+        self.assertEqual(self.sub.read_text(), original)
+
+    def test_hand_edit_of_nested_file_detected(self):
+        self.run_cli("status")  # establish hashes
+        self.sub.write_text("\\section{Sub}\nSub body, hand-edited.\n")
+        from tools.latex_draft import check_external_changes
+
+        warning = check_external_changes(self.tex, self.state())
+        self.assertIsNotNone(warning)
+        self.assertIn("sub.tex", warning)
+
+    def test_cycle_tolerated(self):
+        # chapter1 inputs sub, sub inputs chapter1: no infinite loop
+        self.sub.write_text("\\section{Sub}\nSub body.\n\\input{chapter1}\n")
+        from tools.latex_draft import tex_inputs
+
+        names = [d.name for d in tex_inputs(self.tex)]
+        self.assertEqual(sorted(names), ["chapter1.tex", "sub.tex"])
+
+    def test_changelog_attributes_nested_file(self):
+        from tools.latex_draft import read_changelog
+
+        self.run_cli(
+            "draft-insert",
+            "--file",
+            "sub.tex",
+            "--at-line",
+            "1",
+            "--text",
+            "x.",
+        )
+        entries = [e for e in read_changelog(self.tex) if e["kind"] == "change"]
+        self.assertEqual(entries[-1]["file"], "sub.tex")
+
+
 class TestCompileAndStatus(LatexDraftCase):
     def test_compile_without_engine_warns_but_succeeds(self):
         # latexmk/pdflatex are not installed in this environment

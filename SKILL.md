@@ -51,12 +51,13 @@ deletions struck through — the user inspects the PDF and decides.
 files (`\input`/`\include` in the main file), pass `--file <name.tex>` to any
 `draft-*` command to draft directly into that part (e.g.
 `draft-insert --file chapter1.tex --after "..." --text "..."`). The file
-must be one of the main file's `\input`/`\include` dependencies. Anchors are
-searched only within the target file, the `changes` package is only injected
-into the main file, and the changelog records which file each change
-touched. Everything else — accept/reject, undo, backups, hand-edit detection
-— works across all files of the document automatically. (`status` lists the
-detected input files.)
+must be one of the main file's `\input`/`\include` dependencies —
+**discovered transitively**, so a chapter that itself `\input`s a subsection
+works too (`--file sub.tex`). Anchors are searched only within the target
+file, the `changes` package is only injected into the main file, and the
+changelog records which file each change touched. Everything else —
+accept/reject, undo, backups, hand-edit detection — works across all files
+of the document automatically. (`status` lists the detected input files.)
 
 ## Clarify before acting (vague instructions)
 
