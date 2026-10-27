@@ -70,9 +70,12 @@ def backups_dir(tex: Path) -> Path:
 
 def load_state(tex: Path) -> dict:
     path = state_path(tex)
+    corrupt = False
     if path.exists():
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                raise ValueError("state file is not a JSON object")
             if "last_backup" in state:  # migrate from the 5-minute-backup era
                 del state["last_backup"]
             state.setdefault("drafts", {})
@@ -80,22 +83,70 @@ def load_state(tex: Path) -> dict:
             state.setdefault("turn", 0)
             state.setdefault("full_backup_done", False)
             state.setdefault("injected_preamble", [])
+            # Hashes used to be keyed by absolute path; a copied or moved
+            # project then looked hand-edited. Re-key them relative to the
+            # main file's directory.
+            state["file_hashes"] = {
+                _rel_key(tex, Path(p)): h
+                for p, h in (state.get("file_hashes") or {}).items()
+            }
             return state
-        except json.JSONDecodeError:
-            pass
-    return {
+        except (json.JSONDecodeError, ValueError):
+            corrupt = True
+    state = {
         "drafts": {},
         "file_hashes": {},
         "turn": 0,
         "full_backup_done": False,
         "injected_preamble": [],
     }
+    if corrupt:
+        # The document still carries its draft blocks; recover them from the
+        # markers instead of silently forgetting pending drafts.
+        state["_recovered"] = _recover_pending_drafts(tex, state)
+    return state
 
 
 def save_state(tex: Path, state: dict) -> None:
     state_path(tex).write_text(
-        json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(
+            {k: v for k, v in state.items() if not k.startswith("_")},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
     )
+
+
+def _recover_pending_drafts(tex: Path, state: dict) -> int:
+    """Rebuild pending draft records from the marker blocks in the document.
+
+    Used when the state file is unreadable: the blocks are the source of
+    truth, so they can still be listed, accepted or rejected.
+    """
+    recovered = 0
+    for f in watched_files(tex):
+        try:
+            text = read_tex(f)
+        except (OSError, DraftError):
+            continue
+        for m in BLOCK_RE.finditer(text):
+            did = m.group(1)
+            if did in state["drafts"]:
+                continue
+            body = m.group(2)
+            preview = (
+                extract_command_content(body, "added")
+                or extract_command_content(body, "deleted")
+                or body
+            )
+            rec = draft_record(did, "unknown", preview)
+            rec["file"] = f.name
+            rec["recovered"] = True
+            state["drafts"][did] = rec
+            recovered += 1
+    return recovered
 
 
 def new_id(state: dict) -> str:
@@ -171,9 +222,14 @@ def _include_relevant_text(text: str) -> str:
 
 
 def tex_inputs(tex: Path) -> list[Path]:
-    """Files pulled in via \\input/\\include, resolved transitively (a chapter
-    that itself \\input's a subsection is followed), relative to the main
-    file. Cycles are tolerated."""
+    r"""Files pulled in via \\input/\\include, resolved transitively (a chapter
+    that itself \\input's a subsection is followed).
+
+    TeX resolves those paths relative to the directory pdflatex runs in —
+    the main file's directory — not relative to the including file, so a
+    nested ``\input{chapters/sec}`` is looked up in ``<main dir>/chapters``.
+    Cycles are tolerated.
+    """
     deps: list[Path] = []
     seen: set[Path] = {tex.resolve()}
     queue = [tex]
@@ -185,12 +241,12 @@ def tex_inputs(tex: Path) -> list[Path]:
             continue
         names: list[tuple[Path, str]] = []
         for match in INPUT_RE.finditer(text):
-            names.append((current.parent, match.group(1).strip()))
+            names.append((tex.parent, match.group(1).strip()))
         for match in SUBFILE_RE.finditer(text):
-            names.append((current.parent, match.group(1).strip()))
+            names.append((tex.parent, match.group(1).strip()))
         for match in IMPORT_RE.finditer(text):
             # \import{dir}{file}: the file lives in dir, inputs relative to it
-            names.append((current.parent / match.group(1).strip(), match.group(2).strip()))
+            names.append((tex.parent / match.group(1).strip(), match.group(2).strip()))
         for base, name in names:
             candidate = base / name
             if not candidate.suffix:
@@ -208,13 +264,24 @@ def watched_files(tex: Path) -> list[Path]:
     return [tex, *tex_inputs(tex)]
 
 
+def _rel_key(tex: Path, path: Path) -> str:
+    """Key a watched file by its path relative to the main file's directory.
+
+    Absolute keys would make a copied or renamed project look hand-edited.
+    """
+    try:
+        return path.resolve().relative_to(tex.parent.resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
 def current_hashes(tex: Path) -> dict[str, str]:
     hashes: dict[str, str] = {}
     for f in watched_files(tex):
         try:
-            hashes[str(f)] = sha256(read_tex(f))
+            hashes[_rel_key(tex, f)] = sha256(read_tex(f))
         except OSError:
-            hashes[str(f)] = "<unreadable>"
+            hashes[_rel_key(tex, f)] = "<unreadable>"
     return hashes
 
 
@@ -319,7 +386,29 @@ def list_snapshots(tex: Path) -> list[Path]:
     return sorted(snaps, reverse=True)
 
 
-def snapshot(tex: Path, note: str = "", full: bool = False) -> Path:
+def _dep_copy_name(tex: Path, dep: Path) -> str:
+    """Name component for a dependency copy inside the backup directory.
+
+    Paths below the main file's directory keep their structure with "__" as
+    the separator, so a nested chapter is restored to its own directory.
+    """
+    try:
+        rel = dep.resolve().relative_to(tex.parent.resolve())
+    except ValueError:
+        return dep.name
+    return "__".join(rel.parts)
+
+
+def snapshot(
+    tex: Path, note: str = "", full: bool = False, files: list[Path] | None = None
+) -> Path:
+    """Copy the main file (plus `files`, or every input when `full`) into the
+    backup directory.
+
+    `files` is the per-change case: the file that is about to be edited is
+    snapshotted as it was before the change, so a chapter edit is recoverable
+    from its own snapshot and not only from the initial full backup.
+    """
     bdir = backups_dir(tex)
     bdir.mkdir(parents=True, exist_ok=True)
     seq = 0
@@ -329,10 +418,11 @@ def snapshot(tex: Path, note: str = "", full: bool = False) -> Path:
             seq = max(seq, int(m.group(1)))
     dest = bdir / f"{time.strftime('%Y%m%d-%H%M%S')}-{seq + 1:06d}.tex"
     shutil.copy2(tex, dest)
-    if full:
-        for dep in tex_inputs(tex):
-            dep_dest = bdir / f"{dest.stem}__{dep.name}"
-            shutil.copy2(dep, dep_dest)
+    deps = tex_inputs(tex) if full else list(files or [])
+    for dep in deps:
+        if not dep.is_file() or dep.resolve() == tex.resolve():
+            continue
+        shutil.copy2(dep, bdir / f"{dest.stem}__{_dep_copy_name(tex, dep)}")
     if note:
         dest.with_suffix(dest.suffix + ".note").write_text(note + "\n")
     if not full:
@@ -341,14 +431,15 @@ def snapshot(tex: Path, note: str = "", full: bool = False) -> Path:
 
 
 def restore_snapshot(tex: Path, snap: Path) -> None:
-    """Restore a snapshot; also restores any dependency files stored in it."""
+    """Restore a snapshot; also restores any dependency files stored in it,
+    recreating chapters the user deleted since."""
     bdir = backups_dir(tex)
     shutil.copy2(snap, tex)
     for dep_snap in bdir.glob(f"{snap.stem}__*.tex"):
         name = dep_snap.name[len(snap.stem) + 2 :]
-        target = tex.parent / name
-        if target.is_file():
-            shutil.copy2(dep_snap, target)
+        target = tex.parent.joinpath(*name.split("__"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dep_snap, target)
 
 
 def prune(tex: Path) -> None:
@@ -524,6 +615,38 @@ def _record_injected(state: dict, old: str, new: str) -> None:
             recorded.append(line)
 
 
+def _injected_lines(tex: Path, state: dict) -> list[str]:
+    """Preamble lines this tool added, from the state and from the changelog.
+
+    Undoing an accept restores the file content (including the injected
+    preamble) but the state's provenance list was emptied by the strip, so
+    the changelog diffs are the persistent record of what the tool wrote.
+    """
+    lines = list(state.get("injected_preamble") or [])
+    for entry in read_changelog(tex):
+        if entry.get("kind") != "change":
+            continue
+        before = entry.get("before") or ""
+        after = entry.get("after") or ""
+        if not before or not after:
+            continue
+        old_lines = set(before.split("\n"))
+        # A drafted preamble command (draft-preamble) is also "a line the
+        # change added", but it is the user's text, not an injection: skip
+        # anything inside a draft block.
+        block_spans = [m.span() for m in BLOCK_RE.finditer(after)]
+        pos = 0
+        for line in after.split("\n"):
+            start, pos = pos, pos + len(line) + 1
+            if line in old_lines or line in lines:
+                continue
+            if any(a <= start < b for a, b in block_spans):
+                continue
+            if INJECTED_LINE_RE.fullmatch(line.strip()):
+                lines.append(line)
+    return lines
+
+
 def split_paragraphs(text: str) -> list[str]:
     r"""Split drafted text into paragraphs at blank lines.
 
@@ -597,6 +720,25 @@ def find_preamble_end(text: str) -> int:
     raise DraftError("no \\begin{document} found — cannot locate the preamble")
 
 
+def document_bounds(lines: list[str]) -> tuple[int, int] | None:
+    r"""Line indices of \begin{document} and \end{document} in a main file.
+
+    Returns None for an included file, which has no document environment of
+    its own.
+    """
+    begin = end = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if begin is None and stripped.startswith("\\begin{document}"):
+            begin = i
+        elif begin is not None and stripped.startswith("\\end{document}"):
+            end = i
+            break
+    if begin is None:
+        return None
+    return begin, end if end is not None else len(lines)
+
+
 def insert_block(
     text: str,
     block: str,
@@ -668,6 +810,20 @@ def insert_block(
                 f"anchor {needle!r} matched {len(hits)} lines (need exactly 1)"
             )
         pos = hits[0] + 1 if after is not None else hits[0]
+    bounds = document_bounds(lines)
+    if bounds is not None:
+        begin, end = bounds
+        if pos <= begin:
+            # \added/\deleted are body commands: in the preamble they abort
+            # compilation with "Missing \begin{document}". draft-preamble is
+            # the command for that region, so a body draft aimed at the
+            # preamble is placed at the top of the body instead.
+            pos = begin + 1
+        if pos > end:
+            raise DraftError(
+                "insertion point is after \\end{document}; TeX would ignore "
+                "the draft"
+            )
     block_start: int | None = None
     for i, line in enumerate(lines):
         if block_start is None and re.fullmatch(r"% latex-draft:[0-9a-f]{8}", line):
@@ -908,7 +1064,9 @@ def mutate(tex: Path, state: dict, note: str, fn, target: Path | None = None) ->
     """
     target = target or tex
     before_text = read_tex(target)
-    snap = snapshot(tex, note)
+    snap = snapshot(
+        tex, note, files=[target] if target.resolve() != tex.resolve() else None
+    )
     new_text = fn(before_text)
     assert_no_external_change(tex, state)
     entry = {
@@ -933,14 +1091,30 @@ def mutate(tex: Path, state: dict, note: str, fn, target: Path | None = None) ->
 # ---------------------------------------------------------------- commands
 
 
+def _validate_target(fn, target: Path, tex: Path) -> str | None:
+    """Run a draft's text transformation without writing anything.
+
+    For a draft aimed at a chapter, the main file's preamble is prepared
+    first (included files cannot load the changes package), so the draft
+    itself must be validated before that happens: a bad anchor otherwise
+    leaves the preamble of the main file modified. The main file needs no
+    dry run — its preamble injection and the block are written in one step.
+    """
+    if target.resolve() == tex.resolve():
+        return None
+    try:
+        fn(read_tex(target))
+    except DraftError as e:
+        return str(e)
+    return None
+
+
 def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
     did = new_id(state)
     author = getattr(args, "author", None) or DEFAULT_AUTHOR
     target = resolve_target(tex, getattr(args, "file", None))
     if target is None:
         return 2
-    if target != tex:
-        ensure_document_preamble(tex, state, author)
 
     def fn(text: str) -> str:
         if target == tex:
@@ -954,6 +1128,13 @@ def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
             before=args.before,
             at_line=args.at_line,
         )
+
+    error = _validate_target(fn, target, tex)
+    if error:
+        print(f"latex-draft: {error}", file=sys.stderr)
+        return 2
+    if target != tex:
+        ensure_document_preamble(tex, state, author)
 
     try:
         mutate(tex, state, f"draft insert {did}", fn, target=target)
@@ -994,6 +1175,45 @@ def resolve_target(tex: Path, file_arg: str | None) -> Path | None:
     return candidate
 
 
+def _visible_span(text: str, old: str) -> tuple[int, int] | None:
+    """Character span of `old` outside every pending draft block."""
+    spans = [m.span() for m in BLOCK_RE.finditer(text)]
+    start = 0
+    while True:
+        i = text.find(old, start)
+        if i < 0:
+            return None
+        if not any(a <= i < b for a, b in spans):
+            return i, i + len(old)
+        start = i + 1
+
+
+def _line_span(text: str, span: tuple[int, int]) -> tuple[int, int]:
+    """Widen a character span to whole lines.
+
+    A draft block always occupies whole lines: the marker comments swallow
+    anything that follows them on the same line, so text left after an end
+    marker would vanish from the review PDF.
+    """
+    start = text.rfind("\n", 0, span[0]) + 1
+    stop = text.find("\n", span[1])
+    return start, len(text) if stop < 0 else stop
+
+
+def _assert_body_text(text: str, index: int) -> None:
+    r"""Refuse a body draft that lands in the preamble.
+
+    \added/\deleted (and \footnote) cannot be typeset before
+    \begin{document}; draft-preamble is the command for that region.
+    """
+    m = re.search(r"^[ \t]*\\begin\{document\}", text, re.MULTILINE)
+    if m and index < m.start():
+        raise DraftError(
+            "the text is in the preamble, where \\added/\\deleted cannot be "
+            "typeset; use draft-preamble for preamble changes"
+        )
+
+
 def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str) -> int:
     did = new_id(state)
     old = args.old
@@ -1002,9 +1222,11 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
     target = resolve_target(tex, getattr(args, "file", None))
     if target is None:
         return 2
-    if target != tex:
-        ensure_document_preamble(tex, state, author)
     text = target.read_text(encoding="utf-8")
+
+    def replacement(removed: str) -> str:
+        """The line(s) in their accepted form."""
+        return removed.replace(old, "" if new is None else new, 1)
 
     def fn(text: str) -> str:
         if target == tex:
@@ -1021,10 +1243,22 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
         matches = list(BLOCK_RE.finditer(text))
         host = None
         for m in matches:
-            if old in m.group(2):
-                host = m  # innermost pending block containing the old text
+            deleted = extract_command_content(m.group(2), "deleted")
+            if deleted is not None and old in deleted:
+                host = m  # innermost pending block that deletes the old text
+        if host is None and any(old in m.group(2) for m in matches):
+            # The text exists only inside a pending draft's \added content.
+            # Editing it here would duplicate it: the original insert would
+            # still be spliced in on accept.
+            raise DraftError(
+                "--old text is inside the text a pending draft adds; "
+                "accept or reject that draft before editing it"
+            )
         if host is not None:
-            block = build_block(did, old=old, new=new, author=author)
+            removed = extract_command_content(host.group(2), "deleted")
+            block = build_block(
+                did, old=removed, new=replacement(removed) or None, author=author
+            )
             # BLOCK_RE consumes the trailing newline after the host's end
             # marker, so host.end() is already at a line boundary. A blank
             # line right after the host (the original paragraph break that
@@ -1042,12 +1276,19 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
             # when the rest does not start with one.
             end_sep = "" if (rest.startswith("\n") or not rest) else "\n"
             return text[:insert_at] + block + end_sep + rest
-        if text.count(old) == 1:
-            return text.replace(old, build_block(did, old=old, new=new, author=author))
-        raise DraftError(
-            "--old text matched 0 times (not in the document, not in any "
-            "pending draft block)"
+        span = _visible_span(text, old)
+        if span is None:
+            raise DraftError(
+                "--old text matched 0 times (not in the document, not in any "
+                "pending draft block)"
+            )
+        start, stop = _line_span(text, span)
+        _assert_body_text(text, start)
+        removed = text[start:stop]
+        block = build_block(
+            did, old=removed, new=replacement(removed) or None, author=author
         )
+        return text[:start] + block + text[stop:]
 
     visible = BLOCK_RE.sub("", text)
     if visible.count(old) > 1:
@@ -1063,6 +1304,14 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
             file=sys.stderr,
         )
         return 2
+    # Validate the draft against its target before the main file's preamble
+    # is prepared, so a refused draft leaves every file untouched.
+    error = _validate_target(fn, target, tex)
+    if error:
+        print(f"latex-draft: {error}", file=sys.stderr)
+        return 2
+    if target != tex:
+        ensure_document_preamble(tex, state, author)
 
     try:
         mutate(tex, state, f"draft {op} {did}", fn, target=target)
@@ -1093,8 +1342,6 @@ def cmd_draft_comment(tex: Path, state: dict, args: argparse.Namespace) -> int:
     target = resolve_target(tex, getattr(args, "file", None))
     if target is None:
         return 2
-    if target != tex:
-        ensure_document_preamble(tex, state, author, margin=margin)
 
     def fn(text: str) -> str:
         if target == tex:
@@ -1112,6 +1359,13 @@ def cmd_draft_comment(tex: Path, state: dict, args: argparse.Namespace) -> int:
             before=args.before,
             at_line=args.at_line,
         )
+
+    error = _validate_target(fn, target, tex)
+    if error:
+        print(f"latex-draft: {error}", file=sys.stderr)
+        return 2
+    if target != tex:
+        ensure_document_preamble(tex, state, author, margin=margin)
 
     try:
         mutate(tex, state, f"draft comment {did}", fn, target=target)
@@ -1302,9 +1556,12 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
                 if deleted is not None and deleted in accepted_old:
                     sibling_ids.add(did)
 
-    # All-or-nothing: when a draft block is missing from one file (deleted
-    # by hand), refuse up front instead of leaving the other files resolved
-    # but still marked pending in the state.
+    # A draft block hand-deleted from the document cannot be resolved. When a
+    # specific draft was asked for, refuse up front so the other files are
+    # not left resolved while the state still claims them pending. With
+    # `--all`, close the vanished records (the block is gone; nothing is
+    # pending for them any more) and resolve the drafts that still exist.
+    missing_by_file: dict[str, list[str]] = {}
     for fname, file_ids in by_file.items():
         target = tex if fname == tex.name else tex.parent / fname
         try:
@@ -1317,9 +1574,28 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
             if not any(m.group(1) == did for m in BLOCK_RE.finditer(file_text))
         ]
         if missing_here:
+            missing_by_file[fname] = missing_here
+    if missing_by_file:
+        if not args.all:
+            for fname, missing_here in missing_by_file.items():
+                print(
+                    "latex-draft: draft(s) not found in "
+                    f"{fname}: " + ", ".join(sorted(missing_here)),
+                    file=sys.stderr,
+                )
+            for missing_here in missing_by_file.values():
+                for did in missing_here:
+                    rec = state["drafts"][did]
+                    rec["status"] = "rejected"
+                    rec["resolved"] = datetime.now().isoformat(timespec="seconds")
+                    rec["hand_deleted"] = True
+            save_state(tex, state)
+            return 2
+        for fname, missing_here in missing_by_file.items():
             print(
-                "latex-draft: draft(s) not found in "
-                f"{fname}: " + ", ".join(sorted(missing_here)),
+                "latex-draft: draft(s) no longer in "
+                f"{fname}, marked as rejected: "
+                + ", ".join(sorted(missing_here)),
                 file=sys.stderr,
             )
             for did in missing_here:
@@ -1327,11 +1603,16 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
                 rec["status"] = "rejected"
                 rec["resolved"] = datetime.now().isoformat(timespec="seconds")
                 rec["hand_deleted"] = True
-            # the block is gone from the document; close its record so the
-            # state cannot keep claiming a pending draft that no longer exists
-            save_state(tex, state)
-            return 2
+            ids = [did for did in ids if did not in missing_here]
+            by_file[fname] = [d for d in by_file[fname] if d not in missing_here]
+        save_state(tex, state)
+    # The provenance list is emptied once the preamble is stripped; an undo
+    # of that strip brings the lines back, so recover them from the changelog
+    # rather than leaving them in the document forever.
+    injected = _injected_lines(tex, state)
     for fname, file_ids in by_file.items():
+        if not file_ids:
+            continue
         target = tex if fname == tex.name else tex.parent / fname
         # Resolve the requested drafts and their orphaned siblings in one
         # pass: resolve_drafts deduplicates sibling groups by their shared
@@ -1361,9 +1642,7 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
                     f"draft(s) not found in {fname}: " + ", ".join(sorted(missing))
                 )
             if target == tex and not others_pending:
-                return strip_changes_package_if_unused(
-                    new_text, state.get("injected_preamble")
-                )
+                return strip_changes_package_if_unused(new_text, injected)
             return new_text
 
         try:
@@ -1398,9 +1677,7 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
     # changes package in final mode).
     if not any(rec["status"] == "pending" for rec in state["drafts"].values()):
         def strip_fn(text: str) -> str:
-            return strip_changes_package_if_unused(
-                text, state.get("injected_preamble")
-            )
+            return strip_changes_package_if_unused(text, injected)
 
         mutate(tex, state, "strip unused changes preamble", strip_fn)
         state["injected_preamble"] = []
@@ -1411,7 +1688,8 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
             f"; overlapping draft(s) {', '.join(sorted(sibling_ids))} "
             "resolved as rejected"
         )
-    print(f"latex-draft: {verb}ed {len(ids)} draft(s): {', '.join(ids)}{note}")
+    if ids:
+        print(f"latex-draft: {verb}ed {len(ids)} draft(s): {', '.join(ids)}{note}")
     return 0
 
 
@@ -1421,6 +1699,32 @@ def cmd_accept(tex: Path, state: dict, args: argparse.Namespace) -> int:
 
 def cmd_reject(tex: Path, state: dict, args: argparse.Namespace) -> int:
     return _resolve(tex, state, args, accept=False)
+
+
+PGFSYS_MARK_RE = re.compile(r"\\pgfsyspdfmark\b")
+PGFSYS_PACKAGE_RE = re.compile(
+    r"\\usepackage(?:\[[^\]]*\])?\{(?:tikz|pgf|todonotes|changes)\}"
+)
+
+
+def _clear_stale_aux(tex: Path) -> None:
+    r"""Drop auxiliary data a previous draft compile left behind.
+
+    todonotes/pgf write ``\pgfsyspdfmark`` into the .aux; once the packages
+    are stripped after rejecting the last draft, the next compile dies on the
+    undefined command. The .aux is regenerated anyway, so removing it is safe.
+    """
+    aux = tex.parent / (tex.stem + ".aux")
+    if not aux.is_file():
+        return
+    try:
+        if not PGFSYS_MARK_RE.search(aux.read_text(errors="replace")):
+            return
+        source = "\n".join(read_tex(f) for f in watched_files(tex))
+    except (OSError, DraftError):
+        return
+    if not PGFSYS_PACKAGE_RE.search(source):
+        aux.unlink()
 
 
 def run_latex(tex: Path) -> tuple[int, str]:
@@ -1435,6 +1739,7 @@ def run_latex(tex: Path) -> tuple[int, str]:
         runs = 2
     else:
         return 0, ""
+    _clear_stale_aux(tex)
     proc = None
     for _ in range(runs):
         proc = subprocess.run(cmd, cwd=tex.parent, capture_output=True, text=True)
@@ -2179,6 +2484,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"latex-draft: no such file: {tex}", file=sys.stderr)
         return 2
     state = load_state(tex)
+    if "_recovered" in state:
+        recovered = state.pop("_recovered")
+        print(
+            "latex-draft: WARNING: the state file was unreadable; "
+            f"recovered {recovered} pending draft(s) from the document markers",
+            file=sys.stderr,
+        )
     # Turn-start safety: make sure a full backup exists, and check whether the
     # user edited the file (or its inputs) by hand since the last tool action.
     try:

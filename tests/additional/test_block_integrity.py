@@ -122,12 +122,13 @@ def fragment_old_roundtrips():
 
 @test
 def accept_all_partial_failure_is_consistent():
-    """accept --all that fails on one file must not desync the other files.
+    """accept --all must resolve what still exists and close what vanished.
 
     Scenario: drafts in the main file and in a chapter; the user hand-deletes
-    the chapter's block. accept --all fails on the chapter — but the main
-    file's draft was already merged. Whatever the tool does, afterwards the
-    state must not claim a draft is 'pending' when its block is gone.
+    the chapter's block. A missing block cannot be resolved, but it must not
+    block the drafts that are still there: the command resolves them and
+    closes the vanished record (with a warning), so the state never claims a
+    draft is 'pending' when its block is gone.
     """
     doc = Doc(files={"chapter.tex": "Chapter body.\n"},
               text="\\documentclass{article}\n"
@@ -141,8 +142,13 @@ def accept_all_partial_failure_is_consistent():
                 "", ch, flags=re.DOTALL)
     doc.path("chapter.tex").write_text(ch)
 
-    rc, _, _ = doc.run("accept", "--all")
-    assert rc != 0, "accept --all should fail when a draft block is missing"
+    rc, out, err = doc.run("accept", "--all")
+    assert rc == 0, (
+        "a hand-deleted draft block must not abort accept --all for the "
+        f"drafts that still exist: rc={rc}")
+    assert "marked as rejected" in out + err, (
+        "the vanished draft was closed without telling the user")
+    assert "Main draft." in doc.text(), "the surviving draft was not accepted"
     assert_pending_blocks_exist(doc)
 
 
