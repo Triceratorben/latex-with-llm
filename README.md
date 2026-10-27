@@ -27,7 +27,9 @@ undo/changelog/hand-edit detection span the whole document.
 
 **Alternatives are distinguishable**: pass `--author A`, `--author B`, ...
 when drafting several versions — each author gets a distinct color in the
-PDF. **Comments** default to footnotes; use `draft-comment --margin` for a
+PDF. The label marks *which alternative* a draft is (not agent-vs-user
+provenance; every draft is the agent's proposal, and the user's own edits
+are detected as external changes). The default label is `LLM`. **Comments** default to footnotes; use `draft-comment --margin` for a
 todonotes margin note inside captions, titles, tables, or math. **`undo` is
 refuse-on-conflict** (a change is skipped if the file changed after it;
 `--force` overrides). **`latex-draft <file> check`** is the pre-submission

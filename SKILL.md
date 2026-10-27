@@ -57,6 +57,13 @@ The tool does not enforce the mode — it is a promise you make. Stay in it.
   with different `--new`). Label them with `--author A`, `--author B`, ... so
   each alternative gets a distinct color in the PDF and can be told apart.
   Say which you recommend and why.
+  **`--author` labels alternatives, not provenance.** It is *not* "agent vs
+  user": every draft is your proposal, and the user's own edits are detected
+  as external changes, never as drafts. Use one label per alternative version
+  (A, B, C, ...); the default label is `LLM`. You may also use it to mark a
+  draft as coming from a specific person the user names ("label this one
+  'Alice's suggestion'" → `--author Alice`), but do not invent labels for
+  the user's own text.
 - **Be critical; no unsubstantiated claims.** Do not draft claims that the
   document does not support (no invented results, citations, or superlatives
   like "state-of-the-art" / "novel" without evidence). If the user asks for
