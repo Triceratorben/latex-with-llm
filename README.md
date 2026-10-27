@@ -23,18 +23,26 @@ that part directly. Input files are discovered **transitively** via
 `\input`/`\include`/`\subfile`/`\import`, so nested structures
 (`paper.tex` → `chapter1.tex` → `sub.tex`) work the same way. Anchors are
 matched within the target file, drafts are resolved per file, and
-undo/changelog/hand-edit detection span the whole document.
+undo/changelog/hand-edit detection span the whole document. Draft markup
+lives in the target file, but the `changes` package is loaded in the **main
+file's** preamble automatically (included files cannot carry a preamble),
+and stripped again once no drafts remain pending.
 
 **Alternatives are distinguishable**: pass `--author A`, `--author B`, ...
 when drafting several versions — each author gets a distinct color in the
 PDF. The label marks *which alternative* a draft is (not agent-vs-user
 provenance; every draft is the agent's proposal, and the user's own edits
-are detected as external changes). The default label is `LLM`. **Comments** default to footnotes; use `draft-comment --margin` for a
-todonotes margin note inside captions, titles, tables, or math. **`undo` is
+are detected as external changes). The default label is `LLM`. Alternatives
+are sibling drafts over the same original text: accepting one removes the
+others' markup and marks them rejected (`orphaned_by_overlap`). **Comments**
+default to footnotes; use `draft-comment --margin` for a todonotes margin
+note inside captions, titles, tables, or math. **`undo` is
 refuse-on-conflict** (a change is skipped if the file changed after it;
 `--force` overrides). **`latex-draft <file> check`** is the pre-submission
 check: no pending drafts, no stray `latex-draft:` markers, and no leftover
-auto-injected preamble (which some classes reject in final mode).
+auto-injected preamble (which some classes reject in final mode; the tool
+strips it automatically once no drafts remain pending anywhere in the
+document).
 
 The skill has two modes, declared at the start of a conversation (see
 `SKILL.md`): **Writer** (drafts actual text changes) and **Commenter** (only
@@ -94,10 +102,10 @@ the tool still drafts/backs up and skips compilation with a warning.
 
 **Repair mode**: when `compile` fails, `latex-draft <file> repair` analyzes
 the `.log`, auto-fixes what is safe (a wrong `\end{...}` from a
-`\begin{...}/\end{...}` mismatch; a missing `changes` preamble) as normal
-*drafted* changes you review in the PDF, and prints suggestions for
-everything else (undefined commands/environments, missing files, unbalanced
-braces). See `SKILL.md` → "Repair mode".
+`\begin{...}/\end{...}` mismatch; a missing `changes` preamble) directly in
+the source — snapshotted and changelogged, so undoable with `undo` — and
+prints suggestions for everything else (undefined commands/environments,
+missing files, unbalanced braces). See `SKILL.md` → "Repair mode".
 
 ## Command reference
 
@@ -113,7 +121,7 @@ All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
 | `accept` | merge draft(s) into the file, removing markup | `--id <id>` or `--all` |
 | `reject` | discard draft(s), restoring original text | `--id <id>` or `--all` |
 | `compile` | recompile the PDF; ends the turn (per-turn backup) | — |
-| `repair` | after a failed compile: analyze the log, apply safe fixes as drafts, suggest the rest | — |
+| `repair` | after a failed compile: analyze the log, apply safe fixes, suggest the rest | — |
 | `backup` | take a manual snapshot | `--note "..."` |
 | `undo` | revert recorded changes (refuse-on-conflict) | `--n K` or `--turn`, `--force` |
 | `backups` | list snapshots | — |

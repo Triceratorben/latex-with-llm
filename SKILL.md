@@ -54,9 +54,14 @@ The tool does not enforce the mode — it is a promise you make. Stay in it.
 
 - **Default to several versions.** Unless the user asks for exactly one,
   draft 2–3 alternative wordings/structures (e.g. two `draft-replace` drafts
-  with different `--new`). Label them with `--author A`, `--author B`, ... so
-  each alternative gets a distinct color in the PDF and can be told apart.
-  Say which you recommend and why.
+  with different `--new`, over the same `--old`). Label them with
+  `--author A`, `--author B`, ... so each alternative gets a distinct color
+  in the PDF and can be told apart. Say which you recommend and why.
+  Alternatives are **sibling drafts**: draft each one over the same original
+  text (`--old` is still found inside the first pending draft). Accepting one
+  automatically removes the other alternatives' markup and marks them
+  rejected (`orphaned_by_overlap` in `list` output) — the discarded versions
+  disappear from the PDF together with the one you kept.
   **`--author` labels alternatives, not provenance.** It is *not* "agent vs
   user": every draft is your proposal, and the user's own edits are detected
   as external changes, never as drafts. Use one label per alternative version
@@ -112,11 +117,16 @@ into that part (e.g. `draft-insert --file chapter1.tex --after "..." --text "...
 Input files are discovered **transitively** via `\input`, `\include`,
 `\subfile`, and `\import` — a chapter that itself `\input`s a subsection
 works too (`--file sub.tex`). Bibliography (`.bib`) files are *not* tracked
-or edited. Anchors are searched only within the target file, the `changes`
-package is only injected into the main file, and the changelog records which
-file each change touched. Everything else — accept/reject, undo, backups,
-hand-edit detection — works across all files of the document automatically.
-(`status` lists the detected input files.)
+or edited. Anchors are searched only within the target file. The `changes`
+package (and `todonotes` for `--margin` comments) is injected into the **main
+file's** preamble automatically when the first draft goes into a non-main
+file — included files cannot carry a preamble, so draft markup in them
+relies on the main file loading the package. Once no drafts remain pending
+anywhere in the document, the auto-injected preamble is stripped again (some
+classes reject the `changes` package in final mode). The changelog records
+which file each change touched. Everything else — accept/reject, undo,
+backups, hand-edit detection — works across all files of the document
+automatically. (`status` lists the detected input files.)
 
 **Anchors.** `--after`/`--before` match a substring of exactly one line;
 `--old` may span several lines but must occur exactly once (outside draft
@@ -302,7 +312,7 @@ All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
 | `accept` | merge draft(s) into the file, removing markup | `--id <id>` or `--all` |
 | `reject` | discard draft(s), restoring original text | `--id <id>` or `--all` |
 | `compile` | recompile the PDF; ends the turn (per-turn backup) | — |
-| `repair` | after a failed compile: analyze the log, apply safe fixes as drafts, suggest the rest | — |
+| `repair` | after a failed compile: analyze the log, apply safe fixes, suggest the rest | — |
 | `backup` | take a manual snapshot | `--note "..."` |
 | `undo` | revert recorded changes (refuse-on-conflict) | `--n K` or `--turn`, `--force` |
 | `backups` | list snapshots | — |
@@ -318,20 +328,24 @@ not an input).
 
 `latex-draft repair` analyzes the last `.log` and:
 
-- **Auto-fixes safely**, as normal *drafted* changes (marked with the
-  `changes` package, backed up, changelogged, reviewable in the PDF — nothing
-  is applied silently):
+- **Auto-fixes safely**, applied directly to the source (a repair must
+  compile on its own, so it cannot rely on the `changes` package). Every
+  fix is snapshotted and recorded in the changelog, so it can be undone
+  with `undo` like any other change — nothing is applied silently:
   - a wrong `\end{Y}` from a `\begin{X}`/`\end{Y}` mismatch (located in the
     main file or any input file);
   - a missing `changes` preamble when a draft block uses
-    `\added`/`\deleted`/`\footnote`/`\todo`.
+    `\added`/`\deleted`/`\todo`, or a `\definechangesauthor` placed before
+    the package load.
 - **Prints `SUGGESTION`s** for everything else — undefined control
   sequences (typo? missing `\usepackage`?), undefined environments, missing
-  files, runaway arguments (unbalanced braces) — with the log line number.
+  files, runaway arguments (unbalanced braces), `\footnote` in a context
+  where it is not allowed (use `draft-comment --margin` there) — with the
+  log line number.
 - Recompiles afterwards and reports whether the document builds again.
 
-After `repair`, treat its fixes like any other drafts: `list`, review in the
-PDF, `accept`/`reject`, then `compile`.
+After `repair`, the document is already patched; run `compile` to confirm
+and review the fixed source. Fixes are undoable: `latex-draft undo --n K`.
 
 ## Pre-submission check (cleanup)
 
