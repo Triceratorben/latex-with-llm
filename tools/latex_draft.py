@@ -1369,14 +1369,15 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
             # when placing the sibling.
             insert_at = host.end()
             rest = text[insert_at:]
-            m_blank = re.match(r"\n(?:[ \t]*\n)?", rest)
+            nl = newline_of(text)
+            m_blank = re.match(rf"{nl}(?:[ \t]*{nl})?", rest)
             blank = m_blank.group(0) if m_blank else ""
             insert_at += len(blank)
             rest = text[insert_at:]
             # The end marker must never glue to a following line (e.g.
-            # \end{document} at EOF): ensure a newline after the block
+            # \end{document} at EOF): ensure a line break after the block
             # when the rest does not start with one.
-            end_sep = "" if (rest.startswith("\n") or not rest) else "\n"
+            end_sep = "" if (rest.startswith(("\n", "\r")) or not rest) else nl
             return text[:insert_at] + block + end_sep + rest
         span = _visible_span(text, old)
         if span is None:

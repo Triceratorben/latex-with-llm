@@ -20,7 +20,6 @@ Run:  python3 -m unittest discover -s tests
 
 import contextlib
 import io
-import re
 import shutil
 import subprocess
 import tempfile
@@ -52,11 +51,17 @@ CR_DOC = LF_DOC.replace("\n", "\r")
 
 
 def _eol_uniform(data: bytes, eol: bytes) -> bool:
-    """True when every line break in `data` is exactly `eol`."""
+    """True when every line break in `data` is exactly `eol`.
+
+    Checked by elimination: strip the expected separator and assert no line
+    break at all is left, so a lone LF in a CRLF document (the easy mistake)
+    is caught too.
+    """
     if eol == b"\n":
         return b"\r" not in data
     if eol == b"\r\n":
-        return b"\r" not in data.replace(b"\r\n", b"")
+        rest = data.replace(b"\r\n", b"")
+        return b"\r" not in rest and b"\n" not in rest
     return b"\n" not in data and b"\r\n" not in data
 
 
@@ -200,21 +205,76 @@ class TestLineEndingsStayUniform(LoopCase):
         self.assertTrue(_eol_uniform(self.bytes(), b"\n"))
         self.assertIn(b"Small problems are worth studying.\nDrafted.\n", self.bytes())
 
+    def test_crlf_mid_line_replace_keeps_endings(self):
+        """An inline block (mid-line --old) bypasses the line inserter."""
+        self.doc = CRLF_DOC
+        self.populate()
+        self.assertEqual(self.cli("draft-replace", "--old", "worth", "--new", "well worth"), 0)
+        self.assertTrue(
+            _eol_uniform(self.bytes(), b"\r\n"),
+            "the inline draft block introduced lone LF lines:\n%r" % self.bytes(),
+        )
+        self.assertEqual(self.cli("accept", "--all"), 0)
+        self.assertTrue(_eol_uniform(self.bytes(), b"\r\n"))
+        self.assertIn(b"well worth studying.", self.bytes())
+
+    def test_crlf_mid_line_replace_rejects_byte_identically(self):
+        self.doc = CRLF_DOC
+        self.populate()
+        original = self.bytes()
+        self.assertEqual(self.cli("draft-replace", "--old", "worth", "--new", "well worth"), 0)
+        self.assertEqual(self.cli("reject", "--all"), 0)
+        self.assertEqual(self.bytes(), original)
+
+    def test_cr_mid_line_replace_keeps_endings(self):
+        self.doc = CR_DOC
+        self.populate()
+        self.assertEqual(self.cli("draft-replace", "--old", "worth", "--new", "well worth"), 0)
+        self.assertTrue(
+            _eol_uniform(self.bytes(), b"\r"),
+            "the inline draft block introduced LF or CRLF lines:\n%r" % self.bytes(),
+        )
+        self.assertEqual(self.cli("accept", "--all"), 0)
+        self.assertTrue(_eol_uniform(self.bytes(), b"\r"))
+
+    def test_crlf_sibling_alternatives_keep_endings(self):
+        """Alternatives are the loop's default in Writer mode."""
+        self.doc = CRLF_DOC
+        self.populate()
+        for author, new in (("A", "Version A."), ("B", "Version B.")):
+            self.assertEqual(
+                self.cli("draft-replace", "--author", author,
+                         "--old", "Small problems are worth studying.", "--new", new),
+                0,
+            )
+            self.assertTrue(
+                _eol_uniform(self.bytes(), b"\r\n"),
+                "the sibling block introduced lone LF lines:\n%r" % self.bytes(),
+            )
+        first = self.draft_ids()[0]
+        self.assertEqual(self.cli("accept", "--id", first), 0)
+        self.assertTrue(_eol_uniform(self.bytes(), b"\r\n"))
+        self.assertIn(b"Version A.", self.bytes())
+        self.assertNotIn(b"Version B.", self.bytes())
+
 
 class TestNoSilentBlockCorruption(LoopCase):
     def test_replace_over_a_block_boundary_is_refused(self):
-        """--old may not start outside a pending block and end inside it."""
-        self.assertEqual(self.cli("draft-insert", "--at-line", "3", "--text", "Inserted."), 0)
+        """--old may not start in visible text and end inside a block.
+
+        Such a match would put another draft's marker line inside
+        \\deleted{...}; accept/reject would then mis-pair the markers.
+        """
+        self.assertEqual(self.cli("draft-insert", "--after", "Small problems", "--text", "Inserted."), 0)
         before = self.bytes()
-        body = self.text()
-        marker = re.search(r"% latex-draft-end:[0-9a-f]{8}", body).group(0)
-        # starts in visible text, ends inside the block's end-marker line
-        old = "Small problems are worth studying.\n" + marker[:14]
-        rc = self.cli("draft-replace", "--old", old, "--new", "X")
+        did = self.draft_ids()[0]
+        old = "Small problems are worth studying.\n% latex-draft:" + did
+        rc, out, err = self.cli_out("draft-replace", "--old", old, "--new", "X")
         self.assertEqual(rc, 2)
+        self.assertIn("overlap", err, "refused for the wrong reason: " + err)
         self.assertEqual(self.bytes(), before, "the refused draft still rewrote the file")
-        rc = self.cli("accept", "--all")
-        self.assertEqual(rc, 0, "the surviving draft became unresolvable")
+        self.assertEqual(self.cli("accept", "--all"), 0,
+                         "the surviving draft became unresolvable")
 
     def test_adjacent_drafts_resolve_independently(self):
         """Accepting one draft must not swallow its neighbour's block."""
