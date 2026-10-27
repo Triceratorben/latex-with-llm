@@ -371,13 +371,35 @@ def ensure_changes_package(text: str, author: str = DEFAULT_AUTHOR) -> str:
         if line.startswith("\\documentclass"):
             insert_at = i + 1
             break
-    additions: list[str] = []
     if not have_pkg:
-        additions.append(CHANGES_PACKAGE)
+        # The changes package must be loaded before any \definechangesauthor.
+        lines[insert_at:insert_at] = [CHANGES_PACKAGE]
+        insert_at += 1
     if not have_author:
-        additions.append(author_line(author, _author_color(text, author)))
-    lines[insert_at:insert_at] = additions
+        # Author definitions go after the changes package, never before it.
+        for i, line in enumerate(lines):
+            if re.search(r"\\usepackage(\[[^\]]*\])?\{changes\}", line):
+                insert_at = i + 1
+                break
+        lines.insert(insert_at, author_line(author, _author_color(text, author)))
     return "\n".join(lines)
+
+
+def ensure_document_preamble(tex: Path, state: dict, author: str, margin: bool = False) -> None:
+    """Make sure the *main* file loads the changes package (draft mode) and
+    defines the author, so that drafts written into any \\input/\\include
+    file can use \\added/\\deleted/\\definechangesauthor commands.
+
+    Included files cannot carry the preamble, so this runs before a draft is
+    placed in a non-main file. Idempotent; recorded through the changelog.
+    """
+    text = tex.read_text(encoding="utf-8")
+    new_text = ensure_changes_package(text, author)
+    if margin:
+        new_text = ensure_todonotes_package(new_text)
+    if new_text == text:
+        return
+    mutate(tex, state, f"ensure preamble for drafts (author {author})", lambda t: new_text)
 
 
 def _author_color(text: str, author: str) -> str | None:
@@ -403,9 +425,9 @@ def build_block(
 ) -> str:
     parts = [f"% latex-draft:{did}"]
     if old is not None:
-        parts.append(rf"\deleted[author={author}]{{{old}}}")
+        parts.append(rf"\deleted[id={author}]{{{old}}}")
     if new is not None:
-        parts.append(rf"\added[author={author}]{{{new}}}")
+        parts.append(rf"\added[id={author}]{{{new}}}")
     parts.append(f"% latex-draft-end:{did}")
     return "\n".join(parts)
 
@@ -512,38 +534,6 @@ def extract_command_content(block: str, cmd: str) -> str | None:
     raise DraftError(f"unbalanced braces in \\{cmd} block")
 
 
-def extract_top_command_contents(block: str, cmd: str) -> list[str]:
-    """Top-level \\cmd{...} contents in a block. Alternatives drafted over the
-    same text nest, so only the outermost commands are real alternatives."""
-    matches = list(re.finditer(rf"\\{cmd}(?:\[[^\]]*\])?\{{", block))
-    spans = [(m.start(), m.end()) for m in matches]
-    contents: list[str] = []
-    for (s, e) in spans:
-        depth = 1
-        i = e
-        start = i
-        while i < len(block):
-            ch = block[i]
-            if ch == "\\" and i + 1 < len(block):
-                i += 2
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-        else:
-            raise DraftError(f"unbalanced braces in \\{cmd} block")
-        contents.append(block[start:i])
-    return [
-        content
-        for (s, e), content in zip(spans, contents)
-        if not any(s > s2 and e < e2 for s2, e2 in spans)
-    ]
-
-
 def injected_preamble_line(line: str) -> bool:
     """Whether a preamble line was auto-injected by latex-draft (the changes
     package in draft mode, or any \\definechangesauthor)."""
@@ -563,51 +553,12 @@ def strip_changes_package_if_unused(text: str) -> str:
         line
         for line in text.split("\n")
         if not injected_preamble_line(line)
-        and not re.fullmatch(r"\\usepackage(\[[^\]]*\])?\{todonotes\}", line.strip())
+        and not (
+            re.fullmatch(r"\\usepackage(\[[^\]]*\])?\{todonotes\}", line.strip())
+            and not re.search(r"\\todo\b", text)
+        )
     ]
     return "\n".join(lines)
-
-
-def find_orphaned_drafts(text: str, state: dict) -> list[str]:
-    """Pending drafts whose marker block no longer exists in the document.
-
-    This happens when two drafts overlap (e.g. two alternative versions of
-    the same replacement) and one is accepted: the accepted block consumed
-    both, so the sibling draft has nothing left to resolve.
-    """
-    present = {m.group(1) for m in BLOCK_RE.finditer(text)}
-    return [
-        did
-        for did, rec in state["drafts"].items()
-        if rec["status"] == "pending" and did not in present
-    ]
-
-
-def _added_for_draft(block: str) -> str | None:
-    """The \\added text belonging to the outer draft of a (possibly nested)
-    block: a top-level \\added that is not part of a nested draft block."""
-    for m in re.finditer(r"\\added(?:\[[^\]]*\])?\{", block):
-        nested_before = block.count("% latex-draft:", 0, m.start())
-        nested_after = block.count("% latex-draft-end:", 0, m.start())
-        if nested_before > nested_after:
-            continue  # inside a nested draft block
-        depth = 1
-        i = m.end()
-        start = i
-        while i < len(block):
-            ch = block[i]
-            if ch == "\\" and i + 1 < len(block):
-                i += 2
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    return block[start:i]
-            i += 1
-        raise DraftError("unbalanced braces in \\added block")
-    return None
 
 
 def resolve_drafts(text: str, ids: set[str], accept: bool) -> tuple[str, set[str]]:
@@ -619,18 +570,8 @@ def resolve_drafts(text: str, ids: set[str], accept: bool) -> tuple[str, set[str
             return m.group(0)
         found.add(did)
         had_nl = m.group(0).endswith("\n")
-        if accept:
-            # An accept merges the whole block. Alternatives drafted over the
-            # same text nest inside each other; accepting one alternative
-            # means keeping its own added text and dropping the others.
-            tops = extract_top_command_contents(m.group(2), "added")
-            if len(tops) == 1:
-                return tops[0] + ("\n" if had_nl else "")
-            if len(tops) > 1:
-                own = _added_for_draft(m.group(2))
-                if own is not None:
-                    return own + ("\n" if had_nl else "")
-                return ""
+        # Accept keeps the added text, reject restores the deleted text.
+        # (Alternatives are separate sibling blocks, not nested ones.)
         content = extract_command_content(m.group(2), "added" if accept else "deleted")
         if content is not None:
             if content:
@@ -700,6 +641,8 @@ def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
     target = resolve_target(tex, getattr(args, "file", None))
     if target is None:
         return 2
+    if target != tex:
+        ensure_document_preamble(tex, state, author)
 
     def fn(text: str) -> str:
         if target == tex:
@@ -759,32 +702,35 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
     target = resolve_target(tex, getattr(args, "file", None))
     if target is None:
         return 2
+    if target != tex:
+        ensure_document_preamble(tex, state, author)
     text = target.read_text(encoding="utf-8")
 
     def fn(text: str) -> str:
         if target == tex:
             text = ensure_changes_package(text, author)
         # Draft over the visible occurrence of the old text. If a pending
-        # draft already replaced it, the visible text no longer contains it;
-        # draft over the original inside the outermost pending draft block.
-        if text.count(old) == 1:
-            return text.replace(old, build_block(did, old=old, new=new, author=author))
+        # draft already replaced it, draft an *alternative* as a sibling
+        # block right after the existing one — not nested inside it: the
+        # changes package cannot compile nested \added/\deleted blocks
+        # (brace mismatch), and nesting would make the alternatives
+        # indistinguishable in the PDF. The host check must come first:
+        # the old text still occurs exactly once, inside the pending block.
         matches = list(BLOCK_RE.finditer(text))
-        # innermost pending block containing the old text (a block drafted
-        # over an already-drafted replacement nests inside the outer block)
         host = None
         for m in matches:
             if old in m.group(2):
-                host = m  # later matches are nested inside earlier ones
-        if host is None:
-            raise DraftError(
-                "--old text matched 0 times (not in the document, not in any "
-                "pending draft block)"
-            )
-        inner = host.group(2).replace(
-            old, build_block(did, old=old, new=new, author=author), 1
+                host = m  # innermost pending block containing the old text
+        if host is not None:
+            block = build_block(did, old=old, new=new, author=author)
+            sep = "" if text[host.end() :].startswith("\n") else "\n"
+            return text[: host.end()] + sep + block + text[host.end() :]
+        if text.count(old) == 1:
+            return text.replace(old, build_block(did, old=old, new=new, author=author))
+        raise DraftError(
+            "--old text matched 0 times (not in the document, not in any "
+            "pending draft block)"
         )
-        return text[: host.start(2)] + inner + text[host.end(2) :]
 
     visible = BLOCK_RE.sub("", text)
     if visible.count(old) > 1:
@@ -830,6 +776,8 @@ def cmd_draft_comment(tex: Path, state: dict, args: argparse.Namespace) -> int:
     target = resolve_target(tex, getattr(args, "file", None))
     if target is None:
         return 2
+    if target != tex:
+        ensure_document_preamble(tex, state, author, margin=margin)
 
     def fn(text: str) -> str:
         if target == tex:
@@ -859,15 +807,25 @@ def cmd_draft_comment(tex: Path, state: dict, args: argparse.Namespace) -> int:
 
 
 def ensure_todonotes_package(text: str) -> str:
-    """Inject \\usepackage{todonotes} if missing (for margin-note comments)."""
+    """Inject \\usepackage{todonotes} if missing (for margin-note comments).
+
+    Must run *after* the changes package is in place: todonotes is loaded by
+    changes in draft mode, and a duplicate or earlier load breaks the author
+    definitions that follow."""
     if re.search(r"\\usepackage(\[[^\]]*\])?\{todonotes\}", text):
         return text
     lines = text.split("\n")
+    insert_at = None
     for i, line in enumerate(lines):
-        if line.startswith("\\documentclass"):
-            lines.insert(i + 1, r"\usepackage{todonotes}")
-            return "\n".join(lines)
-    return r"\usepackage{todonotes}" + "\n" + text
+        if re.search(r"\\usepackage(\[[^\]]*\])?\{changes\}", line):
+            insert_at = i + 1
+            break
+    if insert_at is None:
+        raise DraftError(
+            "todonotes needs the changes package; add \\usepackage[draft]{changes} first"
+        )
+    lines.insert(insert_at, r"\usepackage{todonotes}")
+    return "\n".join(lines)
 
 
 def cmd_list(tex: Path, state: dict, args: argparse.Namespace) -> int:
@@ -912,16 +870,59 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
         fname = state["drafts"][did].get("file", tex.name)
         by_file.setdefault(fname, []).append(did)
 
+    # Alternatives are sibling blocks over the same original text. Accepting
+    # one resolves its siblings: they describe a change to text that no
+    # longer exists, so remove their blocks and mark them rejected (the user
+    # sees what was discarded; rejecting them afterwards is a clean error).
+    sibling_ids: set[str] = set()
+    if accept:
+        for fname, file_ids in by_file.items():
+            target = tex if fname == tex.name else tex.parent / fname
+            sibling_text = target.read_text(encoding="utf-8")
+            accepted_old: set[str] = set()
+            for did in file_ids:
+                for m in BLOCK_RE.finditer(sibling_text):
+                    if m.group(1) == did:
+                        deleted = extract_command_content(m.group(2), "deleted")
+                        if deleted is not None:
+                            accepted_old.add(deleted)
+            for did, rec in state["drafts"].items():
+                if (
+                    did in ids
+                    or rec["status"] != "pending"
+                    or rec.get("file", tex.name) != fname
+                ):
+                    continue
+                m = None
+                for cand in BLOCK_RE.finditer(sibling_text):
+                    if cand.group(1) == did:
+                        m = cand
+                        break
+                if m is None:
+                    continue
+                deleted = extract_command_content(m.group(2), "deleted")
+                if deleted is not None and deleted in accepted_old:
+                    sibling_ids.add(did)
+
     for fname, file_ids in by_file.items():
         target = tex if fname == tex.name else tex.parent / fname
+        reject_ids = {d for d in sibling_ids if state["drafts"][d].get("file", tex.name) == fname}
 
-        def fn(text: str, file_ids=file_ids) -> str:
+        def fn(text: str, file_ids=file_ids, reject_ids=reject_ids) -> str:
             new_text, found = resolve_drafts(text, set(file_ids), accept)
             missing = set(file_ids) - found
             if missing:
                 raise DraftError(
                     f"draft(s) not found in {fname}: " + ", ".join(sorted(missing))
                 )
+            if reject_ids:
+                new_text, rej_found = resolve_drafts(new_text, reject_ids, False)
+                missing_rej = reject_ids - rej_found
+                if missing_rej:
+                    raise DraftError(
+                        f"sibling draft(s) not found in {fname}: "
+                        + ", ".join(sorted(missing_rej))
+                    )
             if target == tex:
                 return strip_changes_package_if_unused(new_text)
             return new_text
@@ -931,24 +932,30 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
         except DraftError as e:
             print(f"latex-draft: {e}", file=sys.stderr)
             return 2
-    # A draft whose block was consumed by resolving an overlapping draft is
-    # resolved as well: its text is already gone (reject) or merged (accept).
-    if accept:
-        orphans = find_orphaned_drafts(tex.read_text(encoding="utf-8"), state)
-        orphans = [d for d in orphans if d not in ids]
-        for did in orphans:
-            state["drafts"][did]["status"] = "rejected"
-            state["drafts"][did]["resolved"] = datetime.now().isoformat(
-                timespec="seconds"
-            )
-            state["drafts"][did]["orphaned_by_overlap"] = True
     for did in ids:
         state["drafts"][did]["status"] = verb + "ed"
         state["drafts"][did]["resolved"] = datetime.now().isoformat(timespec="seconds")
+    now = datetime.now().isoformat(timespec="seconds")
+    for did in sibling_ids:
+        rec = state["drafts"][did]
+        rec["status"] = "rejected"
+        rec["resolved"] = now
+        rec["orphaned_by_overlap"] = True
+    # Once no draft markers remain anywhere in the document, strip the
+    # auto-injected preamble from the main file (some classes reject the
+    # changes package in final mode).
+    if not any(rec["status"] == "pending" for rec in state["drafts"].values()):
+        def strip_fn(text: str) -> str:
+            return strip_changes_package_if_unused(text)
+
+        mutate(tex, state, "strip unused changes preamble", strip_fn)
     save_state(tex, state)
     note = ""
-    if accept and orphans:
-        note = f"; overlapping draft(s) {', '.join(orphans)} resolved as rejected"
+    if sibling_ids:
+        note = (
+            f"; overlapping draft(s) {', '.join(sorted(sibling_ids))} "
+            "resolved as rejected"
+        )
     print(f"latex-draft: {verb}ed {len(ids)} draft(s): {', '.join(ids)}{note}")
     return 0
 
@@ -1017,11 +1024,19 @@ def cmd_compile(tex: Path, state: dict, args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- repair
 
 UNDEFINED_CONTROL_RE = re.compile(
-    r"! Undefined control sequence\.\s*\n?l\.(\d+)\s*(\\?[a-zA-Z@]+)"
+    # TeX reports "! Undefined control sequence." then either
+    # "<recently read> \cmd" or "l.NN <source line with \cmd>" — the command
+    # may sit anywhere on that line, not necessarily at the start.
+    r"! Undefined control sequence\.\s*\n"
+    r"(?:<recently read>\s*)?\n?"
+    r"(?:l\.(\d+)\s*)?"
+    r"[^\n]*?(\\[a-zA-Z@]+)"
 )
 UNDEFINED_ENV_RE = re.compile(r"! LaTeX Error: Environment (\S+) undefined\.")
 MISSING_FILE_RE = re.compile(r"! LaTeX Error: File `([^']+)' not found\.")
-MISSING_BEGEND_RE = re.compile(r"! LaTeX Error: \\begin\{([^}]+)\} ended by \\end\{([^}]+)\}\.")
+MISSING_BEGEND_RE = re.compile(
+    r"! LaTeX Error: \\begin\{([^}]+)\}(?: on input line \d+)? ended by \\end\{([^}]+)\}\."
+)  # modern LaTeX adds "on input line N"; older formats do not
 RUNAWAY_RE = re.compile(r"! File ended while scanning use of \\([a-zA-Z]+)\.")
 EMERGENCY_STOP_RE = re.compile(r"! Emergency stop\.")
 
@@ -1035,10 +1050,11 @@ def analyze_log(tex: Path) -> list[dict]:
     problems: list[dict] = []
     for m in UNDEFINED_CONTROL_RE.finditer(text):
         command = (m.group(2) or "").lstrip("\\")
+        line = int(m.group(1)) if m.group(1) else None
         problems.append({
             "kind": "undefined-control",
             "command": command,
-            "line": int(m.group(1)),
+            "line": line,
             "detail": m.group(0).splitlines()[0],
         })
     for m in UNDEFINED_ENV_RE.finditer(text):
@@ -1144,43 +1160,57 @@ def cmd_repair(tex: Path, state: dict, args: argparse.Namespace) -> int:
             if begin_hits and end_hits:
                 # pair them up in order; the mismatch is the first unpaired \end
                 target, lineno = end_hits[len(begin_hits) - 1] if len(end_hits) >= len(begin_hits) else end_hits[-1]
-                did = new_id(state)
-                wrong = rf"\end{{{p['end']}}}"
-                right = rf"\end{{{p['begin']}}}"
+                wrong = "\\end{" + p["end"] + "}"
+                right = "\\end{" + p["begin"] + "}"
+                # A repair must compile on its own, so it may not rely on the
+                # changes package: patch the source directly. The change is
+                # still snapshotted and changelogged (so it can be undone).
                 mutate(
                     tex,
                     state,
-                    f"repair: \\end{{{p['end']}}} -> \\end{{{p['begin']}}} "
+                    f"repair: {wrong} -> {right} "
                     f"in {target.name}:{lineno}",
-                    lambda text: text.replace(
-                        wrong, build_block(did, old=wrong, new=right), 1
-                    ),
+                    lambda text: text.replace(wrong, right, 1),
                     target=target,
                 )
-                state["drafts"][did] = draft_record(did, "replace", right)
-                state["drafts"][did]["file"] = target.name
-                state["drafts"][did]["repair"] = True
-                save_state(tex, state)
                 fixed += 1
                 continue
             suggestions.append(f"fix the mismatched \\end{{{p['end']}}} by hand")
         elif p["kind"] == "undefined-control" and p.get("command") in (
-            "added", "deleted", "footnote", "todo",
+            "added", "deleted", "todo",
         ):
-            text = tex.read_text(encoding="utf-8")
-            if "changes" not in text:
-                mutate(
-                    tex,
-                    state,
-                    "repair: inject changes package preamble",
-                    ensure_changes_package,
-                )
-                fixed += 1
-                continue
-            suggestions.append(
-                f"\\{p['command']} is undefined but the changes package is "
-                "loaded; check the preamble by hand"
+            # A changes-package command without the package: inject the
+            # preamble into the main file (included files cannot carry it).
+            mutate(
+                tex,
+                state,
+                "repair: inject changes package preamble",
+                ensure_changes_package,
             )
+            fixed += 1
+            continue
+        elif p["kind"] == "undefined-control" and p.get("command") == "footnote":
+            # \footnote outside a float/paragraph context, or a draft comment
+            # left behind after the preamble was stripped: the command itself
+            # is standard LaTeX, so this is a real error — suggest, don't fix.
+            suggestions.append(
+                "\\footnote is undefined here (it is not allowed in this "
+                "context, e.g. inside a caption or a section title); move it "
+                "or use a margin note (draft-comment --margin)"
+            )
+        elif p["kind"] == "undefined-control" and p.get("command") in (
+            "definechangesauthor",
+        ):
+            # An author definition before the changes package: move the
+            # package load above it.
+            mutate(
+                tex,
+                state,
+                "repair: load changes package before \\definechangesauthor",
+                ensure_changes_package,
+            )
+            fixed += 1
+            continue
         elif p["kind"] == "undefined-control":
             suggestions.append(
                 f"undefined \\{p.get('command', '?')} (log line {p.get('line', '?')}): "

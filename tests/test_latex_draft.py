@@ -73,7 +73,7 @@ class TestInsert(LatexDraftCase):
         text = self.tex.read_text()
         did = self.draft_ids()[0]
         self.assertIn(f"% latex-draft:{did}", text)
-        self.assertIn(r"\added[author=LLM]{New sentence.}", text)
+        self.assertIn(r"\added[id=LLM]{New sentence.}", text)
         self.assertIn(f"% latex-draft-end:{did}", text)
         self.assertIn("\\usepackage[draft]{changes}", text)
 
@@ -101,8 +101,8 @@ class TestReplaceDelete(LatexDraftCase):
         )
         self.assertEqual(rc, 0)
         text = self.tex.read_text()
-        self.assertIn(r"\deleted[author=LLM]{Small problems are worth studying.}", text)
-        self.assertIn(r"\added[author=LLM]{Big problems are worth studying.}", text)
+        self.assertIn(r"\deleted[id=LLM]{Small problems are worth studying.}", text)
+        self.assertIn(r"\added[id=LLM]{Big problems are worth studying.}", text)
 
     def test_replace_requires_unique_old(self):
         rc = self.run_cli("draft-replace", "--old", "o", "--new", "x")
@@ -112,7 +112,7 @@ class TestReplaceDelete(LatexDraftCase):
         rc = self.run_cli("draft-delete", "--old", "Small problems are worth studying.")
         self.assertEqual(rc, 0)
         text = self.tex.read_text()
-        self.assertIn(r"\deleted[author=LLM]{Small problems are worth studying.}", text)
+        self.assertIn(r"\deleted[id=LLM]{Small problems are worth studying.}", text)
         self.assertNotIn(r"\added", text)
 
 
@@ -363,9 +363,11 @@ class TestChangelog(LatexDraftCase):
         self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
         self.run_cli("accept", "--all")
         entries = [e for e in read_changelog(self.tex) if e["kind"] == "change"]
-        self.assertEqual(len(entries), 2)
+        # draft insert, accept, and the preamble strip that follows the accept
+        self.assertEqual(len(entries), 3)
         self.assertEqual(entries[0]["turn"], 0)
         self.assertIn("draft insert", entries[0]["note"])
+        self.assertIn("strip", entries[2]["note"])
 
     def test_undo_turn_reverts_whole_turn(self):
         self.run_cli("draft-insert", "--at-line", "5", "--text", "one.")
@@ -494,10 +496,11 @@ class TestMultiFile(LatexDraftCase):
         main_tex = self.tex.read_text()
         did = self.draft_ids()[0]
         self.assertIn(f"% latex-draft:{did}", chapter)
-        self.assertIn(r"\added[author=LLM]{Drafted chapter sentence.}", chapter)
-        # the main file is untouched and gets no changes preamble
+        self.assertIn(r"\added[id=LLM]{Drafted chapter sentence.}", chapter)
+        # the main file gets the changes preamble (included files cannot
+        # carry it) but no draft markers of its own
         self.assertNotIn("latex-draft:", main_tex)
-        self.assertNotIn("usepackage[draft]{changes}", main_tex)
+        self.assertIn("usepackage[draft]{changes}", main_tex)
         self.assertEqual(self.state()["drafts"][did]["file"], "chapter1.tex")
 
     def test_draft_replace_in_chapter(self):
@@ -511,8 +514,8 @@ class TestMultiFile(LatexDraftCase):
             "Rewritten chapter body.",
         )
         self.assertEqual(rc, 0)
-        self.assertIn(r"\deleted[author=LLM]{Chapter body text.}", self.chapter.read_text())
-        self.assertIn(r"\added[author=LLM]{Rewritten chapter body.}", self.chapter.read_text())
+        self.assertIn(r"\deleted[id=LLM]{Chapter body text.}", self.chapter.read_text())
+        self.assertIn(r"\added[id=LLM]{Rewritten chapter body.}", self.chapter.read_text())
 
     def test_accept_draft_in_chapter(self):
         self.run_cli(
@@ -725,7 +728,7 @@ class TestNestedFiles(LatexDraftCase):
         self.assertEqual(rc, 0)
         sub = self.sub.read_text()
         self.assertIn("latex-draft:", sub)
-        self.assertIn(r"\added[author=LLM]{Nested draft.}", sub)
+        self.assertIn(r"\added[id=LLM]{Nested draft.}", sub)
         did = self.draft_ids()[0]
         self.assertEqual(self.state()["drafts"][did]["file"], "sub.tex")
         # intermediate and main files untouched
@@ -746,7 +749,8 @@ class TestNestedFiles(LatexDraftCase):
         did = self.draft_ids()[0]
         self.run_cli("accept", "--id", did)
         self.assertIn("Rewritten sub body.", self.sub.read_text())
-        self.run_cli("undo", "--n", "2")  # undo the accept and the draft
+        # undo the preamble strip, the accept, and the draft
+        self.run_cli("undo", "--n", "3")
         self.assertEqual(self.sub.read_text(), original)
 
     def test_hand_edit_of_nested_file_detected(self):
@@ -803,8 +807,8 @@ class TestAuthorLabeling(LatexDraftCase):
             "Version B.",
         )
         text = self.tex.read_text()
-        self.assertIn(r"\added[author=A]{Version A.}", text)
-        self.assertIn(r"\added[author=B]{Version B.}", text)
+        self.assertIn(r"\added[id=A]{Version A.}", text)
+        self.assertIn(r"\added[id=B]{Version B.}", text)
         self.assertIn(r"\definechangesauthor[color=blue,name=A]{A}", text)
         self.assertIn(r"\definechangesauthor[color=orange,name=B]{B}", text)
         # draft records carry the author
@@ -1002,7 +1006,7 @@ l.6 \\badcommand
 """
 
 MISMATCH_LOG = """This is pdfTeX
-! LaTeX Error: \\begin{document} ended by \\end{documnt}.
+! LaTeX Error: \\begin{document} on input line 4 ended by \\end{documnt}.
 ! Emergency stop.
 """
 
@@ -1029,20 +1033,22 @@ class TestRepair(LatexDraftCase):
 
         self.assertEqual(analyze_log(self.tex), [])
 
-    def test_repair_fixes_begin_end_mismatch_as_draft(self):
+    def test_repair_fixes_begin_end_mismatch_directly(self):
         self.tex.write_text(PAPER.replace("\\end{document}", "\\end{documnt}"))
         self.write_log(MISMATCH_LOG)
         # no LaTeX engine here, so run_latex inside repair returns 0
         rc = self.run_cli("repair")
         self.assertEqual(rc, 0)
-        # the fix is a normal drafted change: marked, pending, reversible
+        # the fix patches the source directly (a repair must compile on its
+        # own, without the changes package), and is changelogged (undoable)
         text = self.tex.read_text()
-        self.assertIn("latex-draft:", text)
-        did = self.draft_ids()[0]
-        self.assertEqual(self.state()["drafts"][did]["op"], "replace")
-        self.run_cli("accept", "--id", did)
-        self.assertIn("\\end{document}", self.tex.read_text())
-        self.assertNotIn("documnt", self.tex.read_text())
+        self.assertNotIn("documnt", text)
+        self.assertIn("\\end{document}", text)
+        self.assertNotIn("latex-draft:", text)
+        self.assertEqual(self.draft_ids(), [])
+        # the repair is reversible via the changelog
+        self.run_cli("undo", "--n", "1")
+        self.assertIn("documnt", self.tex.read_text())
 
     def test_repair_suggests_for_unfixable_errors(self):
         self.write_log(SAMPLE_LOG)
