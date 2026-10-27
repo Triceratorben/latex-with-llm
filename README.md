@@ -32,6 +32,11 @@ versions, avoids unsubstantiated claims, pushes back when an instruction
 seems wrong, and asks 2–4 concrete clarifying questions instead of drafting
 when an instruction is too vague (e.g. "make the paper").
 
+At **session end** the agent runs a reference check: it spawns a subagent to
+validate that every `\cite{key}` has a matching bibliography entry (or checks
+them itself if a subagent is unavailable), fixes or flags problems as drafts,
+and finishes with a final `compile` and `status`.
+
 ## Layout
 
 - `SKILL.md` — the skill guide: the turn protocol an LLM agent follows.

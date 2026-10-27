@@ -287,6 +287,24 @@ The user may edit the `.tex` file directly, even mid-turn:
   write; if the file changed while the change was being prepared, the write
   is **aborted** and the user's edit is never clobbered.
 
+## Session end (when the user is done editing)
+
+Before closing a session, finish with a **reference check**:
+
+1. `latex-draft <file> changelog` — review what changed this session. If any
+   turn added citations (`\cite{...}`, `\bibliography`, `\addbibresource`,
+   `thebibliography`), validate them:
+2. **Spawn a subagent** to check the validity of the references — every
+   `\cite{key}` must have a matching bibliography entry, and every entry
+   should be cited. Ask the subagent to report dangling `\cite`s and unused
+   entries; fix them as new drafts (Writer) or flag them with
+   `draft-comment` (Commenter).
+3. **If a subagent is unavailable, check yourself**: `grep` the `.tex`
+   files for `\cite{...}` keys and for the corresponding
+   `\bibitem{...}` entries / `.bib` keys, and compare the two sets.
+4. End the session with a final `latex-draft <file> compile` so the PDF is
+   up to date, and `latex-draft <file> status` to confirm a clean state.
+
 ## Rules
 
 - One turn = user input → turn-start check → drafted change(s) via the
