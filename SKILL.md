@@ -200,6 +200,31 @@ Every turn — TURN or RESOLVE — **must end with exactly one `compile`**.
 A turn that drafted but did not compile is an error: fix it by compiling
 before doing anything else.
 
+## Command reference
+
+All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
+`<main.tex>` is always the **main** file of the document, even when editing
+a chapter (use `--file` for that).
+
+| Command | Purpose | Key options |
+|---|---|---|
+| `draft-insert` | draft inserting text at an anchor | `--after` / `--before` / `--at-line N` (exactly one), `--text`, `--file` |
+| `draft-replace` | draft replacing existing text | `--old` (unique), `--new`, `--file` |
+| `draft-delete` | draft deleting existing text | `--old` (unique), `--file` |
+| `draft-comment` | draft a footnote at an anchor (Commenter mode) | `--after` / `--before` / `--at-line N`, `--text`, `--file` |
+| `list` | list drafts: id, status, op, preview | — |
+| `accept` | merge draft(s) into the file, removing markup | `--id <id>` or `--all` |
+| `reject` | discard draft(s), restoring original text | `--id <id>` or `--all` |
+| `compile` | recompile the PDF; ends the turn (per-turn backup) | — |
+| `backup` | take a manual snapshot | `--note "..."` |
+| `undo` | revert recorded changes | `--n K` or `--turn` |
+| `backups` | list snapshots | — |
+| `changelog` | show the change log | `--last N` |
+| `status` | summary: turn, drafts, changes, backups, pdf, inputs, warnings | — |
+
+Exit codes: `0` success, `1` nothing to do / runtime failure, `2` usage error
+(unknown draft id, ambiguous anchor, text not found, file not an input).
+
 ## Change log and undo
 
 Every change the tool makes is appended to an append-only changelog

@@ -73,3 +73,28 @@ python3 tools/latex_draft.py my-paper.tex backups       # list snapshots
 Requires Python 3.10+ (standard library only). Compiling requires
 `latexmk` or `pdflatex` with the `changes` package; without a LaTeX engine
 the tool still drafts/backs up and skips compilation with a warning.
+
+## Command reference
+
+All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
+
+| Command | Purpose | Key options |
+|---|---|---|
+| `draft-insert` | draft inserting text at an anchor | `--after` / `--before` / `--at-line N` (exactly one), `--text`, `--file` |
+| `draft-replace` | draft replacing existing text | `--old` (unique), `--new`, `--file` |
+| `draft-delete` | draft deleting existing text | `--old` (unique), `--file` |
+| `draft-comment` | draft a footnote at an anchor (Commenter mode) | `--after` / `--before` / `--at-line N`, `--text`, `--file` |
+| `list` | list drafts: id, status, op, preview | — |
+| `accept` | merge draft(s) into the file, removing markup | `--id <id>` or `--all` |
+| `reject` | discard draft(s), restoring original text | `--id <id>` or `--all` |
+| `compile` | recompile the PDF; ends the turn (per-turn backup) | — |
+| `backup` | take a manual snapshot | `--note "..."` |
+| `undo` | revert recorded changes | `--n K` or `--turn` |
+| `backups` | list snapshots | — |
+| `changelog` | show the change log | `--last N` |
+| `status` | summary: turn, drafts, changes, backups, pdf, inputs, warnings | — |
+
+Exit codes: `0` success, `1` nothing to do / runtime failure, `2` usage error
+(unknown draft id, ambiguous anchor, text not found, file not an input).
+See `SKILL.md` for the full guide: modes, the conversation state machine,
+and the per-state command rules.
