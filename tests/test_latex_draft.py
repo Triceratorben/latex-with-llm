@@ -44,7 +44,16 @@ class LatexDraftCase(unittest.TestCase):
         return load_state(self.tex)
 
     def draft_ids(self):
-        return list(self.state()["drafts"])
+        # Drafts in document order (the state file is saved with sort_keys,
+        # so dict order is alphabetical by id, not creation order). After a
+        # resolve, blocks are gone from the document, so fall back to
+        # state-file order for resolved drafts and append them at the end.
+        text = self.tex.read_text()
+        doc_order = [m.group(1) for m in BLOCK_RE.finditer(text)]
+        state = self.state()["drafts"]
+        ordered = [d for d in doc_order if d in state]
+        ordered += [d for d in state if d not in doc_order]
+        return ordered
 
 
 class TestChangesPackage(LatexDraftCase):
@@ -295,9 +304,10 @@ class TestBlockParsing(unittest.TestCase):
     def test_resolve_roundtrip(self):
         block = build_block("abcd1234", new="hello")
         text = "A\n" + block + "\nB"
-        out, found = resolve_drafts(text, {"abcd1234"}, accept=True)
+        out, found, spliced = resolve_drafts(text, {"abcd1234"}, accept=True)
         self.assertEqual(out, "A\nhello\nB")
         self.assertEqual(found, {"abcd1234"})
+        self.assertEqual(spliced, set())  # pure insert: no deleted span
 
     def test_block_re_matches(self):
         block = build_block("abcd1234", new="x")
@@ -1134,8 +1144,11 @@ class TestSiblingGroupResolution(LatexDraftCase):
         self.assertNotIn("Variant C.", text)
         # the original text is gone (replaced, not duplicated)
         self.assertNotIn("Small problems are worth studying.\n", text)
-        # siblings are marked rejected (orphaned)
-        for did in self.draft_ids()[1:]:
+        # siblings are marked rejected (orphaned): every draft except the
+        # accepted one
+        for did in self.state()["drafts"]:
+            if did == id_a:
+                continue
             self.assertEqual(self.state()["drafts"][did]["status"], "rejected")
             self.assertTrue(self.state()["drafts"][did].get("orphaned_by_overlap"))
 

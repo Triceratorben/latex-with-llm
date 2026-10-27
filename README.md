@@ -17,16 +17,25 @@ change, and one per turn at `compile`. The tool detects hand edits — between
 turns (with a warning, recorded in the changelog) and even mid-write (the
 change is aborted, never clobbered).
 
+**File fidelity**: CRLF/CR line endings survive a draft cycle byte-identically;
+documents must be UTF-8 (a non-UTF-8 file gets a clean error, not a traceback);
+unbalanced braces in drafted text are escaped so accept never truncates; and
+the auto-strip at resolve time removes only the preamble lines the tool itself
+injected — your own `\usepackage{changes}` or `\definechangesauthor` lines are
+never touched.
+
 **Multi-file papers** (a `paper.tex` stitched together from chapters) are
 fully supported: pass `--file chapter1.tex` to any `draft-*` command to edit
 that part directly. Input files are discovered **transitively** via
 `\input`/`\include`/`\subfile`/`\import`, so nested structures
-(`paper.tex` → `chapter1.tex` → `sub.tex`) work the same way. Anchors are
-matched within the target file, drafts are resolved per file, and
-undo/changelog/hand-edit detection span the whole document. Draft markup
-lives in the target file, but the `changes` package is loaded in the **main
-file's** preamble automatically (included files cannot carry a preamble),
-and stripped again once no drafts remain pending.
+(`paper.tex` → `chapter1.tex` → `sub.tex`) work the same way. Commented-out
+(`% \input{...}`) and verbatim-environment `\input`s are not real inclusions
+and are ignored. Anchors are matched within the target file, drafts are
+resolved per file, and undo/changelog/hand-edit detection span the whole
+document. Draft markup lives in the target file, but the `changes` package is
+loaded in the **main file's** preamble automatically (included files cannot
+carry a preamble), and stripped again once no drafts remain pending — only
+the lines the tool injected are removed, never your own.
 
 **Alternatives are distinguishable**: pass `--author A`, `--author B`, ...
 when drafting several versions — each author gets a distinct color in the

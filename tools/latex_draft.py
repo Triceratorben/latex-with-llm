@@ -79,6 +79,7 @@ def load_state(tex: Path) -> dict:
             state.setdefault("file_hashes", {})
             state.setdefault("turn", 0)
             state.setdefault("full_backup_done", False)
+            state.setdefault("injected_preamble", [])
             return state
         except json.JSONDecodeError:
             pass
@@ -87,6 +88,7 @@ def load_state(tex: Path) -> dict:
         "file_hashes": {},
         "turn": 0,
         "full_backup_done": False,
+        "injected_preamble": [],
     }
 
 
@@ -110,6 +112,64 @@ def sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def read_tex(path: Path) -> str:
+    """Read a .tex file exactly as stored: no universal-newline translation
+    (CRLF/CR endings must survive a draft -> reject cycle byte-identically)
+    and a clean DraftError instead of a traceback on non-UTF-8 content."""
+    try:
+        with path.open("r", encoding="utf-8", newline="") as fh:
+            return fh.read()
+    except UnicodeDecodeError as e:
+        raise DraftError(
+            f"{path.name} is not valid UTF-8 ({e}); latex-draft only edits "
+            "UTF-8 documents"
+        ) from e
+
+
+def write_tex(path: Path, text: str) -> None:
+    """Write a .tex file without newline translation (see read_tex)."""
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+
+
+VERBATIM_BEGIN_RE = re.compile(
+    r"\\begin\{(verbatim\*?|lstlisting|Verbatim|alltt)\}"
+)
+VERBATIM_END_RE = re.compile(
+    r"\\end\{(verbatim\*?|lstlisting|Verbatim|alltt)\}"
+)
+
+
+def _include_relevant_text(text: str) -> str:
+    """The part of a document that can pull files in: comment text stripped,
+    verbatim bodies skipped. A \\input in a comment or a verbatim example is
+    literal text, not an inclusion."""
+    out = []
+    in_verb = False
+    for line in text.split("\n"):
+        begins = VERBATIM_BEGIN_RE.search(line)
+        ends = VERBATIM_END_RE.search(line)
+        if in_verb:
+            if ends:
+                in_verb = False
+            continue
+        if begins:
+            in_verb = not (ends and ends.start() > begins.start())
+            continue
+        cut = None
+        for m in re.finditer("%", line):
+            nbs = 0
+            j = m.start() - 1
+            while j >= 0 and line[j] == "\\":
+                nbs += 1
+                j -= 1
+            if nbs % 2 == 0:
+                cut = m.start()
+                break
+        out.append(line[:cut] if cut is not None else line)
+    return "\n".join(out)
+
+
 def tex_inputs(tex: Path) -> list[Path]:
     """Files pulled in via \\input/\\include, resolved transitively (a chapter
     that itself \\input's a subsection is followed), relative to the main
@@ -120,8 +180,8 @@ def tex_inputs(tex: Path) -> list[Path]:
     while queue:
         current = queue.pop(0)
         try:
-            text = current.read_text(encoding="utf-8")
-        except OSError:
+            text = _include_relevant_text(read_tex(current))
+        except (OSError, DraftError):
             continue
         names: list[tuple[Path, str]] = []
         for match in INPUT_RE.finditer(text):
@@ -152,7 +212,7 @@ def current_hashes(tex: Path) -> dict[str, str]:
     hashes: dict[str, str] = {}
     for f in watched_files(tex):
         try:
-            hashes[str(f)] = sha256(f.read_text(encoding="utf-8"))
+            hashes[str(f)] = sha256(read_tex(f))
         except OSError:
             hashes[str(f)] = "<unreadable>"
     return hashes
@@ -368,7 +428,7 @@ def ensure_changes_package(text: str, author: str = DEFAULT_AUTHOR) -> str:
         return text
     insert_at = 0
     for i, line in enumerate(lines):
-        if line.startswith("\\documentclass"):
+        if line.lstrip("\ufeff").startswith("\\documentclass"):
             insert_at = i + 1
             break
     if not have_pkg:
@@ -393,12 +453,13 @@ def ensure_document_preamble(tex: Path, state: dict, author: str, margin: bool =
     Included files cannot carry the preamble, so this runs before a draft is
     placed in a non-main file. Idempotent; recorded through the changelog.
     """
-    text = tex.read_text(encoding="utf-8")
+    text = read_tex(tex)
     new_text = ensure_changes_package(text, author)
     if margin:
         new_text = ensure_todonotes_package(new_text)
     if new_text == text:
         return
+    _record_injected(state, text, new_text)
     mutate(tex, state, f"ensure preamble for drafts (author {author})", lambda t: new_text)
 
 
@@ -415,6 +476,52 @@ def _author_color(text: str, author: str) -> str | None:
         if m.group(1) != author
     ]
     return AUTHOR_COLORS[len(others) % len(AUTHOR_COLORS)]
+
+
+def _escape_unbalanced_braces(text: str) -> str:
+    r"""Escape braces that would end the \added/\deleted/\footnote argument
+    early (a literal unmatched "}") or never close (an unmatched "{"), so a
+    drafted block stays parseable and accept never truncates the text."""
+    escape: set[int] = set()
+    opens: list[int] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "{":
+            opens.append(i)
+        elif ch == "}":
+            if opens:
+                opens.pop()
+            else:
+                escape.add(i)
+        i += 1
+    escape.update(opens)
+    if not escape:
+        return text
+    return "".join("\\" + ch if i in escape else ch for i, ch in enumerate(text))
+
+
+INJECTED_LINE_RE = re.compile(
+    r"\\usepackage(\[[^\]]*\])?\{(changes|todonotes)\}"
+    r"|\\definechangesauthor(\[[^\]]*\])?\{[^}]*\}"
+)
+
+
+def _record_injected(state: dict, old: str, new: str) -> None:
+    """Remember which preamble lines latex-draft itself added, so the strip
+    step can later remove exactly those — never a line the user wrote."""
+    if old == new:
+        return
+    old_lines = set(old.split("\n"))
+    recorded = state.setdefault("injected_preamble", [])
+    for line in new.split("\n"):
+        if line in old_lines or line in recorded:
+            continue
+        if INJECTED_LINE_RE.fullmatch(line.strip()):
+            recorded.append(line)
 
 
 def split_paragraphs(text: str) -> list[str]:
@@ -439,11 +546,15 @@ def build_block(
     parts = [f"% latex-draft:{did}"]
     if old is not None:
         for para in split_paragraphs(old):
-            parts.append(rf"\deleted[id={author}]{{{para}}}")
+            parts.append(
+                rf"\deleted[id={author}]{{{_escape_unbalanced_braces(para)}}}"
+            )
             parts.append("")
     if new is not None:
         for para in split_paragraphs(new):
-            parts.append(rf"\added[id={author}]{{{para}}}")
+            parts.append(
+                rf"\added[id={author}]{{{_escape_unbalanced_braces(para)}}}"
+            )
             parts.append("")
     parts.append(f"% latex-draft-end:{did}")
     return "\n".join(parts)
@@ -456,7 +567,8 @@ def build_comment_block(did: str, text: str, margin: bool = False) -> str:
     safe inside captions, section titles, tables and math (a footnote is not)
     and does not shift pagination.
     """
-    cmd = rf"\todo{{{text}}}" if margin else rf"\footnote{{{text}}}"
+    safe = _escape_unbalanced_braces(text)
+    cmd = rf"\todo{{{safe}}}" if margin else rf"\footnote{{{safe}}}"
     return "\n".join([f"% latex-draft:{did}", cmd, f"% latex-draft-end:{did}"])
 
 
@@ -494,6 +606,28 @@ def insert_block(
 ) -> str:
     lines = text.split("\n")
     if at_line is not None:
+        if at_line < 1:
+            raise DraftError(f"--at-line must be >= 1, got {at_line}")
+        # validate the bound first: count the visible lines (same skip rules
+        # as the walk below)
+        total_visible = 0
+        _in_block = False
+        for line in lines:
+            if _in_block:
+                if re.fullmatch(r"% latex-draft-end:[0-9a-f]{8}", line):
+                    _in_block = False
+                continue
+            if re.fullmatch(r"% latex-draft:[0-9a-f]{8}", line):
+                _in_block = True
+                continue
+            if injected_preamble_line(line):
+                continue
+            total_visible += 1
+        if at_line > total_visible:
+            raise DraftError(
+                f"--at-line {at_line} is beyond the end of the document "
+                f"({total_visible} visible lines)"
+            )
         # The user numbers lines of their own document. Skip the auto-injected
         # changes preamble and any pending draft blocks, which are not part of
         # the visible document yet: pos ends up just before the at_line-th
@@ -616,34 +750,88 @@ def injected_preamble_line(line: str) -> bool:
     return bool(CHANGES_AUTHOR_RE.fullmatch(stripped))
 
 
-def strip_changes_package_if_unused(text: str) -> str:
+def strip_changes_package_if_unused(
+    text: str, injected: list[str] | None = None
+) -> str:
     """Remove the auto-injected preamble lines once no draft markers remain,
     so the document is clean for submission (some classes reject the changes
-    package in final mode)."""
+    package in final mode).
+
+    With `injected` (the lines latex-draft recorded adding to this state),
+    exactly those lines are removed — a user-authored todonotes load, changes
+    package or author definition is never touched. Without provenance the
+    old pattern-based behaviour applies."""
     if "% latex-draft:" in text:
         return text
-    lines = [
-        line
-        for line in text.split("\n")
-        if not injected_preamble_line(line)
-        and not (
-            re.fullmatch(r"\\usepackage(\[[^\]]*\])?\{todonotes\}", line.strip())
-            and not re.search(r"\\todo\b", text)
-        )
-    ]
+    if injected is None:
+        lines = [
+            line
+            for line in text.split("\n")
+            if not injected_preamble_line(line)
+            and not (
+                re.fullmatch(
+                    r"\\usepackage(\[[^\]]*\])?\{todonotes\}", line.strip()
+                )
+                and not re.search(r"\\todo\b", text)
+            )
+        ]
+        return "\n".join(lines)
+    keep_todo = bool(re.search(r"\\todo\b", text))
+    injected_set = set(injected)
+    lines = []
+    for line in text.split("\n"):
+        if line in injected_set:
+            if keep_todo and re.fullmatch(
+                r"\\usepackage(\[[^\]]*\])?\{todonotes\}", line.strip()
+            ):
+                lines.append(line)
+            continue
+        lines.append(line)
     return "\n".join(lines)
 
 
-def resolve_drafts(text: str, ids: set[str], accept: bool) -> tuple[str, set[str]]:
+def resolve_drafts(
+    text: str, ids: set[str], accept: bool, accepted_id: str | None = None
+) -> tuple[str, set[str], set[str]]:
+    """Resolve the draft blocks whose ids are in `ids`.
+
+    Returns (new_text, found, spliced). `found` is the set of draft ids whose
+    block was present and resolved; `spliced` is the set of ids whose block
+    actually performed the splice for a shared deleted span.
+
+    `accepted_id` names the one draft the user accepted. On accept of a
+    sibling group, that block (not the first in document order) performs the
+    splice, so the text that lands is the one the user picked. On reject,
+    the first block of the group splices the original text back.
+    """
     found: set[str] = set()
+    spliced: set[str] = set()
     # Sibling alternatives draft over the same original text: each sibling
     # block repeats the same \\deleted{...} span. Resolving must splice the
     # result in only ONCE for the whole group, not once per sibling —
     # otherwise rejecting duplicates the restored text and accepting leaks
     # the other alternatives' additions. Group siblings by their deleted
-    # span: the first block of a group performs the splice, the rest
+    # span: the accepted block of a group performs the splice, the rest
     # collapse to nothing.
     done_groups: set[str] = set()
+    # Pre-scan: map each deleted span to the id that should splice it.
+    # On accept that is the accepted sibling; on reject it is the first
+    # block of the group in document order.
+    splice_winner: dict[str, str] = {}
+    for m in BLOCK_RE.finditer(text):
+        did = m.group(1)
+        if did not in ids:
+            continue
+        if re.search(r"\\(added|deleted|footnote|todo)\b", m.group(2)):
+            deleted = extract_command_content(m.group(2), "deleted")
+            if deleted is not None:
+                key = "del:" + deleted
+                if key not in splice_winner:
+                    if accept and accepted_id is not None:
+                        # find which id in this group is the accepted one
+                        splice_winner[key] = accepted_id
+                    else:
+                        splice_winner[key] = did
 
     def repl(m: re.Match) -> str:
         did = m.group(1)
@@ -678,7 +866,12 @@ def resolve_drafts(text: str, ids: set[str], accept: bool) -> tuple[str, set[str
                 key = "del:" + deleted
                 if key in done_groups:
                     return ""
+                # Only the winner block splices; the rest collapse.
+                winner = splice_winner.get(key)
+                if accept and winner is not None and did != winner:
+                    return ""
                 done_groups.add(key)
+                spliced.add(did)
             if content:
                 return content + ("\n" if had_nl else "")
             return ""
@@ -687,11 +880,11 @@ def resolve_drafts(text: str, ids: set[str], accept: bool) -> tuple[str, set[str
             if content is not None:
                 if not accept:
                     return ""
-                out = rf"\\{cmd}{{{content}}}"
+                out = "\\" + cmd + "{" + content + "}"
                 return out + ("\n" if had_nl else "")
         return ""
 
-    return BLOCK_RE.subn(repl, text)[0], found
+    return BLOCK_RE.subn(repl, text)[0], found, spliced
 
 
 def draft_record(did: str, op: str, preview_text: str) -> dict:
@@ -714,7 +907,7 @@ def mutate(tex: Path, state: dict, note: str, fn, target: Path | None = None) ->
     the document while this change was being prepared (mid-turn race).
     """
     target = target or tex
-    before_text = target.read_text(encoding="utf-8")
+    before_text = read_tex(target)
     snap = snapshot(tex, note)
     new_text = fn(before_text)
     assert_no_external_change(tex, state)
@@ -730,7 +923,7 @@ def mutate(tex: Path, state: dict, note: str, fn, target: Path | None = None) ->
         "after": new_text,
     }
     tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_text(new_text, encoding="utf-8")
+    write_tex(tmp, new_text)
     os.replace(tmp, target)
     append_changelog(tex, entry)
     state["file_hashes"] = current_hashes(tex)
@@ -751,7 +944,9 @@ def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
 
     def fn(text: str) -> str:
         if target == tex:
-            text = ensure_changes_package(text, author)
+            injected = ensure_changes_package(text, author)
+            _record_injected(state, text, injected)
+            text = injected
         return insert_block(
             text,
             build_block(did, new=args.text, author=author),
@@ -813,7 +1008,9 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
 
     def fn(text: str) -> str:
         if target == tex:
-            text = ensure_changes_package(text, author)
+            injected = ensure_changes_package(text, author)
+            _record_injected(state, text, injected)
+            text = injected
         # Draft over the visible occurrence of the old text. If a pending
         # draft already replaced it, draft an *alternative* as a sibling
         # block right after the existing one — not nested inside it: the
@@ -901,9 +1098,13 @@ def cmd_draft_comment(tex: Path, state: dict, args: argparse.Namespace) -> int:
 
     def fn(text: str) -> str:
         if target == tex:
-            text = ensure_changes_package(text, author)
+            injected = ensure_changes_package(text, author)
+            _record_injected(state, text, injected)
+            text = injected
             if margin:
-                text = ensure_todonotes_package(text)
+                injected = ensure_todonotes_package(text)
+                _record_injected(state, text, injected)
+                text = injected
         return insert_block(
             text,
             build_comment_block(did, args.text, margin=margin),
@@ -1066,11 +1267,16 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
     # All siblings (accepted and orphaned) go into the same resolve_drafts
     # call so the group-dedup logic in resolve_drafts collapses the shared
     # span correctly.
+    # other pending drafts (in any file) still need the changes preamble
+    others_pending = any(
+        did not in ids and rec["status"] == "pending"
+        for did, rec in state["drafts"].items()
+    )
     sibling_ids: set[str] = set()
     if accept:
         for fname, file_ids in by_file.items():
             target = tex if fname == tex.name else tex.parent / fname
-            sibling_text = target.read_text(encoding="utf-8")
+            sibling_text = read_tex(target)
             accepted_old: set[str] = set()
             for did in file_ids:
                 for m in BLOCK_RE.finditer(sibling_text):
@@ -1096,6 +1302,35 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
                 if deleted is not None and deleted in accepted_old:
                     sibling_ids.add(did)
 
+    # All-or-nothing: when a draft block is missing from one file (deleted
+    # by hand), refuse up front instead of leaving the other files resolved
+    # but still marked pending in the state.
+    for fname, file_ids in by_file.items():
+        target = tex if fname == tex.name else tex.parent / fname
+        try:
+            file_text = read_tex(target)
+        except (OSError, DraftError):
+            file_text = ""
+        missing_here = [
+            did
+            for did in file_ids
+            if not any(m.group(1) == did for m in BLOCK_RE.finditer(file_text))
+        ]
+        if missing_here:
+            print(
+                "latex-draft: draft(s) not found in "
+                f"{fname}: " + ", ".join(sorted(missing_here)),
+                file=sys.stderr,
+            )
+            for did in missing_here:
+                rec = state["drafts"][did]
+                rec["status"] = "rejected"
+                rec["resolved"] = datetime.now().isoformat(timespec="seconds")
+                rec["hand_deleted"] = True
+            # the block is gone from the document; close its record so the
+            # state cannot keep claiming a pending draft that no longer exists
+            save_state(tex, state)
+            return 2
     for fname, file_ids in by_file.items():
         target = tex if fname == tex.name else tex.parent / fname
         # Resolve the requested drafts and their orphaned siblings in one
@@ -1109,15 +1344,26 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
                 if state["drafts"][d].get("file", tex.name) == fname
             }
 
+        spliced_ids: set[str] = set()
+        # The accepted draft id (single-id accept) tells resolve_drafts
+        # which sibling of a group performs the splice.
+        accepted_id = ids[0] if accept and not args.all and len(ids) == 1 else None
+
         def fn(text: str, file_ids=all_ids) -> str:
-            new_text, found = resolve_drafts(text, file_ids, accept)
+            nonlocal spliced_ids
+            new_text, found, spliced = resolve_drafts(
+                text, file_ids, accept, accepted_id=accepted_id
+            )
+            spliced_ids |= spliced
             missing = file_ids - found
             if missing:
                 raise DraftError(
                     f"draft(s) not found in {fname}: " + ", ".join(sorted(missing))
                 )
-            if target == tex:
-                return strip_changes_package_if_unused(new_text)
+            if target == tex and not others_pending:
+                return strip_changes_package_if_unused(
+                    new_text, state.get("injected_preamble")
+                )
             return new_text
 
         try:
@@ -1125,9 +1371,22 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
         except DraftError as e:
             print(f"latex-draft: {e}", file=sys.stderr)
             return 2
+    # On accept, exactly one sibling per shared deleted span performs the
+    # splice — that is the alternative whose text lands in the document.
+    # The others are orphaned by the overlap. (On reject the first block of
+    # the group splices the original text back; no draft is accepted.)
+    accepted_ids = set(ids) if accept else set()
+    if accept and spliced_ids:
+        accepted_ids = {
+            did for did in ids if did in spliced_ids or did not in sibling_ids
+        }
     for did in ids:
-        state["drafts"][did]["status"] = verb + "ed"
-        state["drafts"][did]["resolved"] = datetime.now().isoformat(timespec="seconds")
+        state["drafts"][did]["status"] = (
+            "accepted" if did in accepted_ids else "rejected"
+        )
+        state["drafts"][did]["resolved"] = datetime.now().isoformat(
+            timespec="seconds"
+        )
     now = datetime.now().isoformat(timespec="seconds")
     for did in sibling_ids:
         rec = state["drafts"][did]
@@ -1139,9 +1398,12 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
     # changes package in final mode).
     if not any(rec["status"] == "pending" for rec in state["drafts"].values()):
         def strip_fn(text: str) -> str:
-            return strip_changes_package_if_unused(text)
+            return strip_changes_package_if_unused(
+                text, state.get("injected_preamble")
+            )
 
         mutate(tex, state, "strip unused changes preamble", strip_fn)
+        state["injected_preamble"] = []
     save_state(tex, state)
     note = ""
     if sibling_ids:
@@ -1285,12 +1547,29 @@ def find_line_in_files(tex: Path, needle: str) -> tuple[Path, int] | None:
     (file, 1-based line number)."""
     for f in watched_files(tex):
         try:
-            lines = f.read_text(encoding="utf-8").splitlines()
-        except OSError:
+            lines = read_tex(f).splitlines()
+        except (OSError, DraftError):
             continue
         for i, line in enumerate(lines, start=1):
             if needle in line:
                 return f, i
+    return None
+
+
+def _first_unpaired_end(text: str, env: str) -> int | None:
+    r"""1-based line number of the first \end{env} that no \begin{env}
+    before it matches — the mismatched one to repair."""
+    depth = 0
+    for i, line in enumerate(text.split("\n"), start=1):
+        for tok in re.finditer(r"\\(begin|end)\{([^}]+)\}", line):
+            if tok.group(2) != env:
+                continue
+            if tok.group(1) == "begin":
+                depth += 1
+            elif depth == 0:
+                return i
+            else:
+                depth -= 1
     return None
 
 
@@ -1310,7 +1589,13 @@ def cmd_repair(tex: Path, state: dict, args: argparse.Namespace) -> int:
     if not problems:
         code, tail = run_latex(tex)
         if code == 0:
-            print(f"latex-draft: nothing to repair; {tex.stem}.pdf compiles")
+            if shutil.which("latexmk") or shutil.which("pdflatex"):
+                print(f"latex-draft: nothing to repair; {tex.stem}.pdf compiles")
+            else:
+                print(
+                    "latex-draft: nothing to repair (no LaTeX engine found; "
+                    "compile not verified)"
+                )
             return 0
         problems = analyze_log(tex)
         if not problems:
@@ -1332,38 +1617,42 @@ def cmd_repair(tex: Path, state: dict, args: argparse.Namespace) -> int:
             # but a document may contain several \end{Y}; fix the one whose
             # line number is closest to (and not before) the position TeX
             # stopped at, preferring the last unmatched \begin{X}.
-            begin_hits = [
-                (f, i)
-                for f in watched_files(tex)
-                for i, line in enumerate(
-                    f.read_text(encoding="utf-8", errors="replace").splitlines(),
-                    start=1,
-                )
-                if rf"\begin{{{p['begin']}}}" in line
-            ]
-            end_hits = [
-                (f, i)
-                for f in watched_files(tex)
-                for i, line in enumerate(
-                    f.read_text(encoding="utf-8", errors="replace").splitlines(),
-                    start=1,
-                )
-                if rf"\end{{{p['end']}}}" in line
-            ]
-            if begin_hits and end_hits:
-                # pair them up in order; the mismatch is the first unpaired \end
-                target, lineno = end_hits[len(begin_hits) - 1] if len(end_hits) >= len(begin_hits) else end_hits[-1]
+            # The mismatched \end is the first \end{X} that no \begin{X}
+            # before it matches. Pairing by counts alone would rewrite a
+            # healthy environment of the same name instead.
+            target = None
+            lineno = None
+            for f in watched_files(tex):
+                try:
+                    f_text = read_tex(f)
+                except (OSError, DraftError):
+                    continue
+                unpaired = _first_unpaired_end(f_text, p["end"])
+                if unpaired is not None:
+                    target, lineno = f, unpaired
+                    break
+            if target is not None:
                 wrong = "\\end{" + p["end"] + "}"
                 right = "\\end{" + p["begin"] + "}"
                 # A repair must compile on its own, so it may not rely on the
                 # changes package: patch the source directly. The change is
                 # still snapshotted and changelogged (so it can be undone).
+                def _fix_end(
+                    text: str, _line=lineno, _wrong=wrong, _right=right
+                ) -> str:
+                    lines = text.split("\n")
+                    idx = _line - 1
+                    if 0 <= idx < len(lines) and _wrong in lines[idx]:
+                        lines[idx] = lines[idx].replace(_wrong, _right, 1)
+                        return "\n".join(lines)
+                    return text.replace(_wrong, _right, 1)
+
                 mutate(
                     tex,
                     state,
                     f"repair: {wrong} -> {right} "
                     f"in {target.name}:{lineno}",
-                    lambda text: text.replace(wrong, right, 1),
+                    _fix_end,
                     target=target,
                 )
                 fixed += 1
@@ -1374,11 +1663,16 @@ def cmd_repair(tex: Path, state: dict, args: argparse.Namespace) -> int:
         ):
             # A changes-package command without the package: inject the
             # preamble into the main file (included files cannot carry it).
+            def _inject_preamble(text: str) -> str:
+                injected = ensure_changes_package(text)
+                _record_injected(state, text, injected)
+                return injected
+
             mutate(
                 tex,
                 state,
                 "repair: inject changes package preamble",
-                ensure_changes_package,
+                _inject_preamble,
             )
             fixed += 1
             continue
@@ -1396,11 +1690,16 @@ def cmd_repair(tex: Path, state: dict, args: argparse.Namespace) -> int:
         ):
             # An author definition before the changes package: move the
             # package load above it.
+            def _inject_preamble_before_author(text: str) -> str:
+                injected = ensure_changes_package(text)
+                _record_injected(state, text, injected)
+                return injected
+
             mutate(
                 tex,
                 state,
                 "repair: load changes package before \\definechangesauthor",
-                ensure_changes_package,
+                _inject_preamble_before_author,
             )
             fixed += 1
             continue
@@ -1432,7 +1731,13 @@ def cmd_repair(tex: Path, state: dict, args: argparse.Namespace) -> int:
         code, tail = run_latex(tex)
         if code == 0:
             pdf = tex.parent / (tex.stem + ".pdf")
-            print(f"latex-draft: repair applied; compiled {pdf.name}")
+            if shutil.which("latexmk") or shutil.which("pdflatex"):
+                print(f"latex-draft: repair applied; compiled {pdf.name}")
+            else:
+                print(
+                    "latex-draft: repair applied (no LaTeX engine found; "
+                    "compile not verified)"
+                )
             return 0
         print(
             f"latex-draft: repair applied but compile still fails; "
@@ -1452,6 +1757,27 @@ def cmd_backup(tex: Path, state: dict, args: argparse.Namespace) -> int:
     save_state(tex, state)
     print(f"latex-draft: backup -> {snap}")
     return 0
+
+
+def _reconcile_draft_status(tex: Path, state: dict) -> None:
+    """After an undo, draft records must match the document again: a block
+    the undo brought back is pending once more; a pending record whose block
+    is gone (the change that created it was undone) is closed."""
+    for did, rec in state["drafts"].items():
+        fname = rec.get("file", tex.name)
+        target = tex if fname == tex.name else tex.parent / fname
+        try:
+            text = read_tex(target)
+        except (OSError, DraftError):
+            continue
+        has_block = any(m.group(1) == did for m in BLOCK_RE.finditer(text))
+        if has_block and rec["status"] != "pending":
+            rec["status"] = "pending"
+            rec.pop("resolved", None)
+            rec.pop("orphaned_by_overlap", None)
+        elif not has_block and rec["status"] == "pending":
+            rec["status"] = "rejected"
+            rec["resolved"] = datetime.now().isoformat(timespec="seconds")
 
 
 def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
@@ -1482,13 +1808,18 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
             targets = [e for e in entries if e.get("turn", 0) == done[-1]]
         # an undo already performed reverts its target; skip entries whose
         # effect is already undone so `undo --turn` cannot loop
-        last_undo = next(
-            (e for e in reversed(read_changelog(tex)) if e.get("kind") == "undo"),
-            None,
-        )
-        if last_undo is not None:
-            undid = last_undo.get("undid_backup")
-            targets = [e for e in targets if e.get("backup") != undid]
+        # every entry undone by the trailing run of undo commands is
+        # already reverted — skip all of them, not just the last one
+        undone_backups = set()
+        for e in reversed(read_changelog(tex)):
+            if e.get("kind") == "undo":
+                undone_backups.add(e.get("undid_backup"))
+            else:
+                break
+        if undone_backups:
+            targets = [
+                e for e in targets if e.get("backup") not in undone_backups
+            ]
             if not targets:
                 print(
                     f"latex-draft: turn {done[-1]} is already undone "
@@ -1501,7 +1832,10 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
             print("latex-draft: changelog is empty, nothing to undo",
                   file=sys.stderr)
             return 1
-        n = max(1, min(args.n, len(entries)))
+        if args.n < 1:
+            print("latex-draft: --n must be >= 1", file=sys.stderr)
+            return 2
+        n = min(args.n, len(entries))
         targets = entries[-n:]
     skipped: list[str] = []
     done_entries: list[dict] = []
@@ -1513,7 +1847,7 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
     for entry in reversed(targets):
         fname = entry.get("file", tex.name)
         target = tex if fname == tex.name else tex.parent / fname
-        current = target.read_text(encoding="utf-8")
+        current = read_tex(target)
         want = expected.get(fname, entry.get("after_sha256"))
         if sha256(current) != want:
             if not force:
@@ -1532,7 +1866,7 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(entry["before"], encoding="utf-8")
+        write_tex(tmp, entry["before"])
         os.replace(tmp, target)
         done_entries.append(entry)
         expected[fname] = entry.get("before_sha256", "")
@@ -1548,6 +1882,7 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
                 "after_sha256": entry.get("before_sha256", ""),
             },
         )
+    _reconcile_draft_status(tex, state)
     state["file_hashes"] = current_hashes(tex)
     save_state(tex, state)
     if not done_entries:
@@ -1633,16 +1968,26 @@ def cmd_check(tex: Path, state: dict, args: argparse.Namespace) -> int:
             f"{len(pending)} pending draft(s): {', '.join(sorted(pending))} "
             "(accept or reject them first)"
         )
+    pending_by_file: dict[str, set[str]] = {}
+    for did, rec in state["drafts"].items():
+        if rec["status"] == "pending":
+            pending_by_file.setdefault(rec.get("file", tex.name), set()).add(did)
     for f in watched_files(tex):
         try:
-            text = f.read_text(encoding="utf-8")
-        except OSError:
+            text = read_tex(f)
+        except (OSError, DraftError):
             continue
-        stray = len(re.findall(r"% latex-draft(-end)?:[0-9a-f]{8}", text))
+        # the markers of the pending drafts the tool knows about are not
+        # stray; only unknown markers are
+        scrubbed = text
+        for m in BLOCK_RE.finditer(text):
+            if m.group(1) in pending_by_file.get(f.name, set()):
+                scrubbed = scrubbed.replace(m.group(0), "")
+        stray = len(re.findall(r"% latex-draft(-end)?:[0-9a-f]{8}", scrubbed))
         if stray:
             problems.append(f"{f.name}: {stray} stray latex-draft marker line(s)")
     if not pending:
-        main_text = tex.read_text(encoding="utf-8")
+        main_text = read_tex(tex)
         leftovers = [
             line.strip()
             for line in main_text.split("\n")
@@ -1836,9 +2181,13 @@ def main(argv: list[str] | None = None) -> int:
     state = load_state(tex)
     # Turn-start safety: make sure a full backup exists, and check whether the
     # user edited the file (or its inputs) by hand since the last tool action.
-    ensure_full_backup(tex, state)
-    check_and_adopt_external(tex, state)
-    rc = HANDLERS[args.command](tex, state, args)
+    try:
+        ensure_full_backup(tex, state)
+        check_and_adopt_external(tex, state)
+        rc = HANDLERS[args.command](tex, state, args)
+    except DraftError as e:
+        print(f"latex-draft: {e}", file=sys.stderr)
+        return 2
     if rc == 0 and args.command in (
         "draft-insert",
         "draft-replace",

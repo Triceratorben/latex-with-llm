@@ -419,6 +419,24 @@ The user may edit the `.tex` files directly, even mid-turn:
   write; if a file changed while the change was being prepared, the write is
   **aborted** and the user's edit is never clobbered.
 
+## File fidelity
+
+The tool treats `.tex` files as bytes the user owns:
+
+- **Line endings are preserved.** CRLF (Windows) and CR-only (classic Mac)
+  documents survive a draft → accept/reject cycle byte-identically; the tool
+  never rewrites your line endings.
+- **Encoding is UTF-8.** A non-UTF-8 file (e.g. latin-1) is refused with a
+  clean error message (`latex-draft: <file> is not valid UTF-8 ...`), not a
+  traceback. A UTF-8 BOM is tolerated.
+- **Unbalanced braces in drafted text** (e.g. `if x} else`) are escaped so
+  the `\added`/`\deleted`/`\footnote` argument stays parseable and accept
+  reproduces the full text — no silent truncation.
+- **Preamble ownership**: the auto-strip at resolve time removes only the
+  lines the tool itself injected (`\usepackage[draft]{changes}`,
+  `\definechangesauthor`, `\usepackage{todonotes}`). A `\usepackage{changes}`
+  or `\definechangesauthor` you wrote yourself is never touched.
+
 ## Session end (when the user is done editing)
 
 Before closing a session, finish with a **reference check**:
