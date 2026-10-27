@@ -12,10 +12,12 @@ Every change is recorded in an append-only **changelog** (full content before
 and after, plus which file it touched), so any change can be undone
 individually (`undo --n K`) or per turn (`undo --turn`). `.tex` files are
 backed up automatically: a full initial backup (main file plus
-`\input`/`\include` dependencies) on first use, a snapshot before every
-change, and one per turn at `compile`. The tool detects hand edits — between
-turns (with a warning, recorded in the changelog) and even mid-write (the
-change is aborted, never clobbered).
+`\input`/`\include` dependencies) on first use, a snapshot of the file about to
+change before every edit, and one per turn at `compile`. The tool detects hand
+edits — between turns (with a warning, recorded in the changelog) and even
+mid-write (the change is aborted, never clobbered) — and the content hashes are
+keyed relative to the document, so copying or moving the project is not
+mistaken for a hand edit.
 
 **File fidelity**: CRLF/CR line endings survive a draft cycle byte-identically;
 documents must be UTF-8 (a non-UTF-8 file gets a clean error, not a traceback);
@@ -75,7 +77,11 @@ and finishes with a final `compile` and `status`.
 - `SKILL.md` — the skill guide: the turn protocol an LLM agent follows.
 - `tools/latex_draft.py` — the single editing tool the skill relies on.
 - `examples/paper.tex` — a minimal example document.
-- `tests/` — test suite for the tool (`python3 -m unittest discover -s tests`).
+- `tests/` — test suite for the tool (`python3 -m unittest discover -s tests`,
+  plus the standalone reviewer suites: `python3 tests/additional/test_*.py`).
+  `tests/extended/` holds the extended (reviewer 2) suite; it is run by the
+  same discovery command and skips its real-LaTeX tests when no engine or
+  LaTeX packages are installed.
 
 ## Quick start
 

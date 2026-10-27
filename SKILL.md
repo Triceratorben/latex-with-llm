@@ -117,8 +117,11 @@ files, pass `--file <name.tex>` to any `draft-*` command to draft directly
 into that part (e.g. `draft-insert --file chapter1.tex --after "..." --text "..."`).
 Input files are discovered **transitively** via `\input`, `\include`,
 `\subfile`, and `\import` — a chapter that itself `\input`s a subsection
-works too (`--file sub.tex`). Bibliography (`.bib`) files are *not* tracked
-or edited. Anchors are searched only within the target file. The `changes`
+works too (`--file sub.tex`). Like pdflatex, the tool resolves those paths
+relative to the **main file's directory**, so `\input{chapters/sec}` inside
+`chapters/ch1.tex` means `<main dir>/chapters/sec.tex`. Bibliography
+(`.bib`) files are *not* tracked or edited. Anchors are searched only within
+the target file. The `changes`
 package (and `todonotes` for `--margin` comments) is injected into the **main
 file's** preamble automatically when the first draft goes into a non-main
 file — included files cannot carry a preamble, so draft markup in them
@@ -134,6 +137,18 @@ automatically. (`status` lists the detected input files.)
 blocks). Keep **one sentence per line** in the source — anchoring into a
 paragraph that is one long line is awkward. If a match is not unique,
 re-read the file and use a longer anchor or `--at-line`.
+
+**Draft placement.** `\added`/`\deleted`/`\footnote`/`\todo` are body
+commands: in the preamble they abort compilation with "Missing
+`\begin{document}`", which is why preamble changes have their own command.
+A body draft whose anchor, line number or `--old` lands in the preamble is
+therefore placed at the top of the body (insert/comment) or refused with a
+pointer to `draft-preamble` (replace/delete), and nothing is ever written
+after `\end{document}`, where TeX would ignore it. In the file, a draft
+block always occupies whole lines — a mid-line `--old` widens to its
+line(s) in the marked-up source, so the marker comments cannot swallow the
+rest of the line in the review PDF; accept/reject still merge/restore
+exactly the intended text.
 
 **Multi-paragraph drafts.** Drafted text may contain blank lines
 (paragraph breaks) — the tool splits them into one `\added`/`\deleted`
@@ -394,12 +409,21 @@ ago — and the whole history is inspectable.
 - `latex-draft undo --turn` — revert **all** changes of the current turn.
 - `latex-draft status` — summary; also warns if a file was edited by hand.
 
+Undo re-derives the draft registry from the document: a draft whose block an
+undo brings back is pending again (and can be accepted or rejected), and a
+record whose block is gone is closed instead of lingering as a phantom
+pending draft. If a draft block was hand-deleted from the file,
+`accept --all` / `reject --all` resolve the drafts that still exist and warn
+about the vanished ones; asking for that specific id is an error (exit 2).
+
 ## Backups (automatic)
 
 - On **first use** on a file, a full initial backup is taken: the main file
   plus every input file (kept forever).
 - A snapshot is taken before **every** mutation (draft, accept, reject) and
-  **once per turn** when the turn ends with `compile`.
+  **once per turn** when the turn ends with `compile`. The snapshot holds the
+  file that is about to change, so a chapter edit is recoverable from its own
+  snapshot, and restoring recreates a chapter the user deleted since.
 - Retention: all snapshots < 1 h, one per hour for 24 h, one per day for 30 d
   (the full initial backup is never pruned).
 - `latex-draft backup --note "..."` — manual snapshot.
@@ -436,6 +460,10 @@ The tool treats `.tex` files as bytes the user owns:
   lines the tool itself injected (`\usepackage[draft]{changes}`,
   `\definechangesauthor`, `\usepackage{todonotes}`). A `\usepackage{changes}`
   or `\definechangesauthor` you wrote yourself is never touched.
+- **Hashes are relative**: state records content hashes relative to the main
+  file's directory, so copying, renaming or moving the project does not look
+  like a hand edit. A corrupt state file is not fatal: the tool says so and
+  recovers the pending drafts from the marker blocks in the document.
 
 ## Session end (when the user is done editing)
 
