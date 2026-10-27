@@ -134,6 +134,13 @@ blocks). Keep **one sentence per line** in the source — anchoring into a
 paragraph that is one long line is awkward. If a match is not unique,
 re-read the file and use a longer anchor or `--at-line`.
 
+**Multi-paragraph drafts.** Drafted text may contain blank lines
+(paragraph breaks) — the tool splits them into one `\added`/`\deleted`
+command per paragraph automatically (the `changes` package cannot take a
+blank line inside a single command argument). On accept/reject the
+paragraphs are reassembled with blank lines, so the merged text is exactly
+what was drafted.
+
 ## Clarify before acting (vague instructions)
 
 **Do not carry out a turn — do not call any mutating tool command and do not

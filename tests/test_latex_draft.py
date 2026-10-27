@@ -1091,5 +1091,94 @@ class TestPrune(LatexDraftCase):
         self.assertEqual(len(remaining), 6)
 
 
+class TestMultiParagraphDrafts(LatexDraftCase):
+    r"""The changes package cannot take a blank line inside \added/\deleted
+    ("Paragraph ended before \addcontentsline was complete"). Multi-paragraph
+    drafts are split into one command per paragraph and reassembled on
+    accept/reject."""
+
+    def test_insert_multi_paragraph_block(self):
+        from tools.latex_draft import build_block
+
+        block = build_block("aaaaaaaa", new="Para one.\n\nPara two.", author="LLM")
+        self.assertIn(r"\added[id=LLM]{Para one.}", block)
+        self.assertIn(r"\added[id=LLM]{Para two.}", block)
+
+    def test_replace_multi_paragraph_roundtrip(self):
+        self.run_cli(
+            "draft-replace",
+            "--old",
+            "Small problems are worth studying.",
+            "--new",
+            "Para one.\n\nPara two.",
+        )
+        did = self.draft_ids()[0]
+        text = self.tex.read_text()
+        # two \added commands, one per paragraph
+        self.assertEqual(text.count(r"\added[id=LLM]{"), 2)
+        # accept reassembles the paragraphs with a blank line
+        self.run_cli("accept", "--id", did)
+        text = self.tex.read_text()
+        self.assertIn("Para one.\n\nPara two.", text)
+        self.assertNotIn("latex-draft:", text)
+
+    def test_reject_multi_paragraph_restores_original(self):
+        original = self.tex.read_text()
+        self.run_cli(
+            "draft-replace",
+            "--old",
+            "Small problems are worth studying.",
+            "--new",
+            "Para one.\n\nPara two.",
+        )
+        did = self.draft_ids()[0]
+        self.run_cli("reject", "--id", did)
+        self.assertEqual(self.tex.read_text(), original)
+
+    def test_delete_multi_paragraph(self):
+        self.tex.write_text(
+            "\\documentclass{article}\n"
+            "\\begin{document}\n"
+            "Delete para one.\n"
+            "\n"
+            "Delete para two.\n"
+            "Keep this.\n"
+            "\\end{document}\n"
+        )
+        rc = self.run_cli(
+            "draft-delete",
+            "--old",
+            "Delete para one.\n\nDelete para two.",
+        )
+        self.assertEqual(rc, 0)
+        text = self.tex.read_text()
+        self.assertEqual(text.count(r"\deleted[id=LLM]{"), 2)
+        did = self.draft_ids()[0]
+        self.run_cli("accept", "--id", did)
+        text = self.tex.read_text()
+        self.assertNotIn("Delete para one.", text)
+        self.assertNotIn("Delete para two.", text)
+        self.assertIn("Keep this.", text)
+
+    def test_extract_command_contents_multiple(self):
+        from tools.latex_draft import extract_command_content
+
+        block = r"\added[id=LLM]{First.}" + "\n\n" + r"\added[id=LLM]{Second.}"
+        self.assertEqual(
+            extract_command_content(block, "added"), "First.\n\nSecond."
+        )
+
+    def test_single_paragraph_unchanged(self):
+        self.run_cli(
+            "draft-replace",
+            "--old",
+            "Small problems are worth studying.",
+            "--new",
+            "One paragraph only.",
+        )
+        text = self.tex.read_text()
+        self.assertEqual(text.count(r"\added[id=LLM]{"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

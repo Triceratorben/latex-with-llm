@@ -417,6 +417,19 @@ def _author_color(text: str, author: str) -> str | None:
     return AUTHOR_COLORS[len(others) % len(AUTHOR_COLORS)]
 
 
+def split_paragraphs(text: str) -> list[str]:
+    r"""Split drafted text into paragraphs at blank lines.
+
+    The `changes` package calls \addcontentsline with the \added/\deleted
+    argument, and that breaks on a blank line (or a \par token) inside the
+    argument: "Paragraph ended before \addcontentsline was complete".
+    Multi-paragraph drafts are therefore emitted as one \added/\deleted
+    command per paragraph, separated by a blank line (valid between
+    commands, invalid inside one).
+    """
+    return re.split(r"\n[ \t]*\n", text)
+
+
 def build_block(
     did: str,
     old: str | None = None,
@@ -425,9 +438,13 @@ def build_block(
 ) -> str:
     parts = [f"% latex-draft:{did}"]
     if old is not None:
-        parts.append(rf"\deleted[id={author}]{{{old}}}")
+        for para in split_paragraphs(old):
+            parts.append(rf"\deleted[id={author}]{{{para}}}")
+            parts.append("")
     if new is not None:
-        parts.append(rf"\added[id={author}]{{{new}}}")
+        for para in split_paragraphs(new):
+            parts.append(rf"\added[id={author}]{{{para}}}")
+            parts.append("")
     parts.append(f"% latex-draft-end:{did}")
     return "\n".join(parts)
 
@@ -509,29 +526,51 @@ def insert_block(
     return "\n".join(lines)
 
 
-def extract_command_content(block: str, cmd: str) -> str | None:
-    m = re.search(rf"\\{cmd}(?:\[[^\]]*\])?\{{", block)
-    if not m:
-        return None
-    depth = 1
-    i = m.end()
-    out: list[str] = []
-    while i < len(block):
-        ch = block[i]
-        if ch == "\\" and i + 1 < len(block):
+def extract_command_contents(block: str, cmd: str) -> list[str]:
+    r"""Contents of every \cmd{...} in a block.
+
+    A multi-paragraph draft emits one \added/\deleted command per
+    paragraph (the changes package cannot take a blank line inside one
+    argument); this returns them all so they can be rejoined.
+    """
+    contents: list[str] = []
+    pos = 0
+    while True:
+        m = re.search(rf"\\{cmd}(?:\[[^\]]*\])?\{{", block[pos:])
+        if not m:
+            return contents
+        depth = 1
+        i = pos + m.end()
+        out: list[str] = []
+        while i < len(block):
+            ch = block[i]
+            if ch == "\\" and i + 1 < len(block):
+                out.append(ch)
+                out.append(block[i + 1])
+                i += 2
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    contents.append("".join(out))
+                    pos = i + 1
+                    break
             out.append(ch)
-            out.append(block[i + 1])
-            i += 2
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return "".join(out)
-        out.append(ch)
-        i += 1
-    raise DraftError(f"unbalanced braces in \\{cmd} block")
+            i += 1
+        else:
+            raise DraftError(f"unbalanced braces in \\{cmd} block")
+
+
+def extract_command_content(block: str, cmd: str) -> str | None:
+    r"""All \cmd{...} contents joined with blank lines (multi-paragraph
+    drafts are split into one command per paragraph; this reassembles
+    them). None when the block has no such command."""
+    contents = extract_command_contents(block, cmd)
+    if not contents:
+        return None
+    return "\n\n".join(contents)
 
 
 def injected_preamble_line(line: str) -> bool:
