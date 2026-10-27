@@ -41,12 +41,15 @@ CHANGES_AUTHOR_RE = re.compile(r"\\definechangesauthor(\[[^\]]*\])?\{[^}]*\}")
 AUTHOR_COLORS = ["blue", "orange", "purple", "brown", "teal", "magenta"]
 
 BLOCK_RE = re.compile(
-    r"% latex-draft:([0-9a-f]{8})\n(.*?)% latex-draft-end:\1\n?", re.DOTALL
+    r"% latex-draft:([0-9a-f]{8})(?:\r\n|\r|\n)(.*?)"
+    r"% latex-draft-end:\1(?:\r\n|\r|\n)?",
+    re.DOTALL,
 )
 SNAP_RE = re.compile(r"^(\d{8})-(\d{6})-")
 INPUT_RE = re.compile(r"\\(?:input|include)(?:\[[^\]]*\])?\{([^}]+)\}")
 SUBFILE_RE = re.compile(r"\\subfile\{([^}]+)\}")
 IMPORT_RE = re.compile(r"\\import\{([^}]+)\}\{([^}]+)\}")
+EOL_RE = re.compile(r"\r\n|\r|\n")
 
 
 class DraftError(Exception):
@@ -183,6 +186,72 @@ def write_tex(path: Path, text: str) -> None:
         fh.write(text)
 
 
+def newline_of(text: str) -> str:
+    """The document's dominant line separator: "\\r\\n", "\\r" or "\\n".
+
+    Drafts are written with the document's own separator, so a CRLF or
+    CR-only document does not end up with mixed line endings after a
+    draft -> accept cycle.
+    """
+    crlf = text.count("\r\n")
+    cr = text.count("\r") - crlf
+    lf = text.count("\n") - crlf
+    if crlf and crlf >= cr and crlf >= lf:
+        return "\r\n"
+    if cr > lf:
+        return "\r"
+    return "\n"
+
+
+def split_lines(text: str) -> list[str]:
+    """Split into lines on any line separator (no terminators kept)."""
+    return EOL_RE.split(text)
+
+
+def split_eol(text: str) -> tuple[list[str], list[str]]:
+    """Split into lines and their terminators.
+
+    `len(lines) == len(eols) + 1`; eols[i] terminates lines[i]. Rebuilding
+    with `join_eol` reproduces the input byte-for-byte, so a mixed-EOL file
+    keeps every untouched line exactly as the user wrote it.
+    """
+    parts = re.split(r"(\r\n|\r|\n)", text)
+    return parts[0::2], parts[1::2]
+
+
+def join_eol(lines: list[str], eols: list[str]) -> str:
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        out.append(line)
+        if i < len(eols):
+            out.append(eols[i])
+    return "".join(out)
+
+
+def insert_lines_at(
+    text: str, pos: int, new_lines: list[str], newline: str | None = None
+) -> str:
+    """Insert whole lines before line `pos`, terminated like the document.
+
+    Untouched lines keep their own terminators byte-for-byte, so a CRLF or
+    CR-only document stays that way and a mixed one is not re-encoded.
+    """
+    lines, eols = split_eol(text)
+    nl = newline or newline_of(text)
+    pos = max(0, min(pos, len(lines)))
+    new_lines = list(new_lines)
+    lines[pos:pos] = new_lines
+    eols[pos:pos] = [nl] * len(new_lines)
+    return join_eol(lines, eols)
+
+
+def to_newline(text: str, newline: str) -> str:
+    """Rewrite a fragment's line separators to `newline`."""
+    if newline == "\n":
+        return text
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", newline)
+
+
 VERBATIM_BEGIN_RE = re.compile(
     r"\\begin\{(verbatim\*?|lstlisting|Verbatim|alltt)\}"
 )
@@ -197,7 +266,7 @@ def _include_relevant_text(text: str) -> str:
     literal text, not an inclusion."""
     out = []
     in_verb = False
-    for line in text.split("\n"):
+    for line in split_lines(text):
         begins = VERBATIM_BEGIN_RE.search(line)
         ends = VERBATIM_END_RE.search(line)
         if in_verb:
@@ -507,7 +576,7 @@ def ensure_changes_package(text: str, author: str = DEFAULT_AUTHOR) -> str:
     """Inject \\usepackage[draft]{changes} plus a \\definechangesauthor for the
     given author (colored when it is not the default, so alternatives are
     distinguishable in the PDF). Idempotent."""
-    lines = text.split("\n")
+    lines = split_lines(text)
     have_pkg = any(
         re.search(r"\\usepackage(\[[^\]]*\])?\{changes\}", line) for line in lines
     )
@@ -524,16 +593,18 @@ def ensure_changes_package(text: str, author: str = DEFAULT_AUTHOR) -> str:
             break
     if not have_pkg:
         # The changes package must be loaded before any \definechangesauthor.
-        lines[insert_at:insert_at] = [CHANGES_PACKAGE]
+        text = insert_lines_at(text, insert_at, [CHANGES_PACKAGE])
         insert_at += 1
     if not have_author:
         # Author definitions go after the changes package, never before it.
-        for i, line in enumerate(lines):
+        for i, line in enumerate(split_lines(text)):
             if re.search(r"\\usepackage(\[[^\]]*\])?\{changes\}", line):
                 insert_at = i + 1
                 break
-        lines.insert(insert_at, author_line(author, _author_color(text, author)))
-    return "\n".join(lines)
+        text = insert_lines_at(
+            text, insert_at, [author_line(author, _author_color(text, author))]
+        )
+    return text
 
 
 def ensure_document_preamble(tex: Path, state: dict, author: str, margin: bool = False) -> None:
@@ -606,9 +677,9 @@ def _record_injected(state: dict, old: str, new: str) -> None:
     step can later remove exactly those — never a line the user wrote."""
     if old == new:
         return
-    old_lines = set(old.split("\n"))
+    old_lines = set(split_lines(old))
     recorded = state.setdefault("injected_preamble", [])
-    for line in new.split("\n"):
+    for line in split_lines(new):
         if line in old_lines or line in recorded:
             continue
         if INJECTED_LINE_RE.fullmatch(line.strip()):
@@ -630,14 +701,16 @@ def _injected_lines(tex: Path, state: dict) -> list[str]:
         after = entry.get("after") or ""
         if not before or not after:
             continue
-        old_lines = set(before.split("\n"))
+        old_lines = set(split_lines(before))
         # A drafted preamble command (draft-preamble) is also "a line the
         # change added", but it is the user's text, not an injection: skip
         # anything inside a draft block.
         block_spans = [m.span() for m in BLOCK_RE.finditer(after)]
         pos = 0
-        for line in after.split("\n"):
-            start, pos = pos, pos + len(line) + 1
+        after_lines, after_eols = split_eol(after)
+        for i, line in enumerate(after_lines):
+            start = pos
+            pos = start + len(line) + (len(after_eols[i]) if i < len(after_eols) else 0)
             if line in old_lines or line in lines:
                 continue
             if any(a <= start < b for a, b in block_spans):
@@ -711,10 +784,20 @@ def build_preamble_block(did: str, text: str) -> str:
     return "\n".join([f"% latex-draft:{did}", text, f"% latex-draft-end:{did}"])
 
 
+def block_for(text: str, block: str) -> str:
+    """Write a draft block with the target file's own line separator.
+
+    Blocks are built with "\\n"; a CRLF or CR-only document must not end up
+    with LF-only lines in the middle of it (mixed endings in the file the
+    user reviews, and in the diff of their VCS).
+    """
+    return to_newline(block, newline_of(text))
+
+
 def find_preamble_end(text: str) -> int:
     """Line index (0-based) of \\begin{document} — the end of the preamble.
     Raises DraftError when the document has no \\begin{document}."""
-    for i, line in enumerate(text.split("\n")):
+    for i, line in enumerate(split_lines(text)):
         if line.strip().startswith("\\begin{document}"):
             return i
     raise DraftError("no \\begin{document} found — cannot locate the preamble")
@@ -746,7 +829,7 @@ def insert_block(
     before: str | None = None,
     at_line: int | None = None,
 ) -> str:
-    lines = text.split("\n")
+    lines = split_lines(text)
     if at_line is not None:
         if at_line < 1:
             raise DraftError(f"--at-line must be >= 1, got {at_line}")
@@ -837,17 +920,10 @@ def insert_block(
                     f"(lines {block_start + 1}-{i + 1})"
                 )
             block_start = None
-    # A draft block always occupies whole lines: ensure the line
-    # before the block ends with a newline (it does, since we split
-    # on "\n"), and ensure the line after the block starts fresh.
-    block_lines = block.split("\n")
-    # When inserting at EOF (pos == len(lines)), the block is the
-    # last content; make sure it ends with a newline so the end
-    # marker is on its own line.
-    if pos >= len(lines) and block_lines and block_lines[-1] != "":
-        block_lines.append("")
-    lines[pos:pos] = block_lines
-    return "\n".join(lines)
+    # A draft block always occupies whole lines; insert_lines_at terminates
+    # every inserted line with the document's own separator, so the end
+    # marker lands on its own line even at EOF.
+    return insert_lines_at(text, pos, split_lines(block))
 
 
 def extract_command_contents(block: str, cmd: str) -> list[str]:
@@ -906,6 +982,21 @@ def injected_preamble_line(line: str) -> bool:
     return bool(CHANGES_AUTHOR_RE.fullmatch(stripped))
 
 
+def _drop_lines(text: str, drop) -> str:
+    """Remove the lines `drop` selects, keeping every other byte intact.
+
+    A removed line takes its own terminator with it; untouched lines keep
+    their original endings (a mixed-EOL file stays mixed), and a document
+    that did not end with a newline still does not.
+    """
+    lines, eols = split_eol(text)
+    keep = [i for i, line in enumerate(lines) if not drop(line)]
+    result = join_eol([lines[i] for i in keep], [eols[i] for i in keep if i < len(eols)])
+    if not text.endswith(("\n", "\r")):
+        result = re.sub(r"(\r\n|\r|\n)$", "", result)
+    return result
+
+
 def strip_changes_package_if_unused(
     text: str, injected: list[str] | None = None
 ) -> str:
@@ -920,30 +1011,31 @@ def strip_changes_package_if_unused(
     if "% latex-draft:" in text:
         return text
     if injected is None:
-        lines = [
-            line
-            for line in text.split("\n")
-            if not injected_preamble_line(line)
-            and not (
-                re.fullmatch(
+        keep_todo = bool(re.search(r"\\todo\b", text))
+
+        def drop(line: str) -> bool:
+            if injected_preamble_line(line):
+                return True
+            return bool(
+                not keep_todo
+                and re.fullmatch(
                     r"\\usepackage(\[[^\]]*\])?\{todonotes\}", line.strip()
                 )
-                and not re.search(r"\\todo\b", text)
             )
-        ]
-        return "\n".join(lines)
+
+        return _drop_lines(text, drop)
     keep_todo = bool(re.search(r"\\todo\b", text))
     injected_set = set(injected)
-    lines = []
-    for line in text.split("\n"):
-        if line in injected_set:
-            if keep_todo and re.fullmatch(
-                r"\\usepackage(\[[^\]]*\])?\{todonotes\}", line.strip()
-            ):
-                lines.append(line)
-            continue
-        lines.append(line)
-    return "\n".join(lines)
+
+    def drop_recorded(line: str) -> bool:
+        if line not in injected_set:
+            return False
+        return not (
+            keep_todo
+            and re.fullmatch(r"\\usepackage(\[[^\]]*\])?\{todonotes\}", line.strip())
+        )
+
+    return _drop_lines(text, drop_recorded)
 
 
 def resolve_drafts(
@@ -994,22 +1086,23 @@ def resolve_drafts(
         if did not in ids:
             return m.group(0)
         found.add(did)
-        # BLOCK_RE consumes the trailing newline after the end marker
-        # (the \n? in the pattern). When the match is immediately followed
-        # by another block (a sibling), the next block starts right after;
-        # when it is followed by a blank line (the original paragraph break
-        # that was behind the replaced text), that blank line survives.
-        # Re-attach the newline only when the following text does not start
-        # with one, so a reject restores the original line structure.
-        had_nl = m.group(0).endswith("\n")
+        # BLOCK_RE consumes the line break after the end marker. When the
+        # match is immediately followed by another block (a sibling), the
+        # next block starts right after; when it is followed by a blank line
+        # (the original paragraph break that was behind the replaced text),
+        # that blank line survives. Re-attach the break only when the
+        # following text does not start with one, so a reject restores the
+        # original line structure — using the document's own separator.
+        had_nl = m.group(0).endswith(("\n", "\r"))
+        nl = newline_of(text)
         # A preamble draft block: raw text between the markers, no
         # \\added/\\deleted. The block occupies whole lines, so reject
         # removes the match entirely (like a pure insert draft); accept
-        # merges the raw text verbatim, keeping the end-marker's newline.
+        # merges the raw text verbatim, keeping the end-marker's break.
         if not re.search(r"\\(added|deleted|footnote|todo)\b", m.group(2)):
             if not accept:
                 return ""
-            return m.group(2).strip("\n") + ("\n" if had_nl else "")
+            return m.group(2).strip("\r\n") + (nl if had_nl else "")
         content = extract_command_content(m.group(2), "added" if accept else "deleted")
         if content is not None:
             deleted = extract_command_content(m.group(2), "deleted")
@@ -1029,15 +1122,15 @@ def resolve_drafts(
                 done_groups.add(key)
                 spliced.add(did)
             if content:
-                return content + ("\n" if had_nl else "")
+                return to_newline(content, nl) + (nl if had_nl else "")
             return ""
         for cmd in ("footnote", "todo"):
             content = extract_command_content(m.group(2), cmd)
             if content is not None:
                 if not accept:
                     return ""
-                out = "\\" + cmd + "{" + content + "}"
-                return out + ("\n" if had_nl else "")
+                out = "\\" + cmd + "{" + to_newline(content, nl) + "}"
+                return out + (nl if had_nl else "")
         return ""
 
     return BLOCK_RE.subn(repl, text)[0], found, spliced
@@ -1123,7 +1216,7 @@ def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
             text = injected
         return insert_block(
             text,
-            build_block(did, new=args.text, author=author),
+            block_for(text, build_block(did, new=args.text, author=author)),
             after=args.after,
             before=args.before,
             at_line=args.at_line,
@@ -1176,15 +1269,21 @@ def resolve_target(tex: Path, file_arg: str | None) -> Path | None:
 
 
 def _visible_span(text: str, old: str) -> tuple[int, int] | None:
-    """Character span of `old` outside every pending draft block."""
+    """Character span of `old` outside every pending draft block.
+
+    A match that merely overlaps a block (starts outside, ends inside, or
+    the other way round) is not a visible occurrence: drafting over it would
+    put another draft's marker lines inside \\deleted{...}.
+    """
     spans = [m.span() for m in BLOCK_RE.finditer(text)]
     start = 0
     while True:
         i = text.find(old, start)
         if i < 0:
             return None
-        if not any(a <= i < b for a, b in spans):
-            return i, i + len(old)
+        stop = i + len(old)
+        if not any(i < b and a < stop for a, b in spans):
+            return i, stop
         start = i + 1
 
 
@@ -1193,11 +1292,11 @@ def _line_span(text: str, span: tuple[int, int]) -> tuple[int, int]:
 
     A draft block always occupies whole lines: the marker comments swallow
     anything that follows them on the same line, so text left after an end
-    marker would vanish from the review PDF.
+    marker would vanish from the review PDF. Works for LF, CRLF and CR.
     """
-    start = text.rfind("\n", 0, span[0]) + 1
-    stop = text.find("\n", span[1])
-    return start, len(text) if stop < 0 else stop
+    start = max(text.rfind("\n", 0, span[0]), text.rfind("\r", 0, span[0])) + 1
+    m = EOL_RE.search(text, span[1])
+    return start, m.start() if m else len(text)
 
 
 def _assert_body_text(text: str, index: int) -> None:
@@ -1256,8 +1355,11 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
             )
         if host is not None:
             removed = extract_command_content(host.group(2), "deleted")
-            block = build_block(
-                did, old=removed, new=replacement(removed) or None, author=author
+            block = block_for(
+                text,
+                build_block(
+                    did, old=removed, new=replacement(removed) or None, author=author
+                ),
             )
             # BLOCK_RE consumes the trailing newline after the host's end
             # marker, so host.end() is already at a line boundary. A blank
@@ -1279,14 +1381,18 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
         span = _visible_span(text, old)
         if span is None:
             raise DraftError(
-                "--old text matched 0 times (not in the document, not in any "
-                "pending draft block)"
+                "--old text matched 0 times outside pending draft blocks "
+                "(a match that overlaps a block cannot be drafted over; "
+                "resolve that draft first)"
             )
         start, stop = _line_span(text, span)
         _assert_body_text(text, start)
         removed = text[start:stop]
-        block = build_block(
-            did, old=removed, new=replacement(removed) or None, author=author
+        block = block_for(
+            text,
+            build_block(
+                did, old=removed, new=replacement(removed) or None, author=author
+            ),
         )
         return text[:start] + block + text[stop:]
 
@@ -1354,7 +1460,7 @@ def cmd_draft_comment(tex: Path, state: dict, args: argparse.Namespace) -> int:
                 text = injected
         return insert_block(
             text,
-            build_comment_block(did, args.text, margin=margin),
+            block_for(text, build_comment_block(did, args.text, margin=margin)),
             after=args.after,
             before=args.before,
             at_line=args.at_line,
@@ -1389,7 +1495,7 @@ def ensure_todonotes_package(text: str) -> str:
     definitions that follow."""
     if re.search(r"\\usepackage(\[[^\]]*\])?\{todonotes\}", text):
         return text
-    lines = text.split("\n")
+    lines = split_lines(text)
     insert_at = None
     for i, line in enumerate(lines):
         if re.search(r"\\usepackage(\[[^\]]*\])?\{changes\}", line):
@@ -1399,8 +1505,7 @@ def ensure_todonotes_package(text: str) -> str:
         raise DraftError(
             "todonotes needs the changes package; add \\usepackage[draft]{changes} first"
         )
-    lines.insert(insert_at, r"\usepackage{todonotes}")
-    return "\n".join(lines)
+    return insert_lines_at(text, insert_at, [r"\usepackage{todonotes}"])
 
 
 def cmd_draft_preamble(tex: Path, state: dict, args: argparse.Namespace) -> int:
@@ -1422,7 +1527,7 @@ def cmd_draft_preamble(tex: Path, state: dict, args: argparse.Namespace) -> int:
     text_arg = args.text
 
     def fn(text: str) -> str:
-        lines = text.split("\n")
+        lines = split_lines(text)
         bd = find_preamble_end(text)
         if position == "start":
             pos = 0
@@ -1455,9 +1560,8 @@ def cmd_draft_preamble(tex: Path, state: dict, args: argparse.Namespace) -> int:
                     "(need exactly 1)"
                 )
             pos = hits[0] + 1
-        block_lines = build_preamble_block(did, text_arg).split("\n")
-        lines[pos:pos] = block_lines
-        return "\n".join(lines)
+        block = block_for(text, build_preamble_block(did, text_arg))
+        return insert_lines_at(text, pos, split_lines(block))
 
     try:
         mutate(tex, state, f"draft preamble {did}", fn)
@@ -1945,11 +2049,11 @@ def cmd_repair(tex: Path, state: dict, args: argparse.Namespace) -> int:
                 def _fix_end(
                     text: str, _line=lineno, _wrong=wrong, _right=right
                 ) -> str:
-                    lines = text.split("\n")
+                    lines, eols = split_eol(text)
                     idx = _line - 1
                     if 0 <= idx < len(lines) and _wrong in lines[idx]:
                         lines[idx] = lines[idx].replace(_wrong, _right, 1)
-                        return "\n".join(lines)
+                        return join_eol(lines, eols)
                     return text.replace(_wrong, _right, 1)
 
                 mutate(
@@ -2152,25 +2256,47 @@ def cmd_undo(tex: Path, state: dict, args: argparse.Namespace) -> int:
     for entry in reversed(targets):
         fname = entry.get("file", tex.name)
         target = tex if fname == tex.name else tex.parent / fname
-        current = read_tex(target)
-        want = expected.get(fname, entry.get("after_sha256"))
-        if sha256(current) != want:
+        try:
+            current = read_tex(target)
+        except (OSError, DraftError):
+            # The file was deleted (or moved) by hand. Replaying the recorded
+            # before-content can recreate it, but only on request: silently
+            # resurrecting a file the user deleted would be a surprise.
             if not force:
                 skipped.append(fname)
                 print(
                     f"latex-draft: skipped '{entry.get('note', '?')}' in "
-                    f"{fname}: the file changed after it (conflict); "
-                    "use --force to restore the recorded content anyway",
+                    f"{fname}: the file is gone; use --force to restore the "
+                    "recorded content",
                     file=sys.stderr,
                 )
                 continue
+            current = None
             print(
-                f"latex-draft: WARNING: {fname} no longer matches the "
-                f"state after '{entry.get('note', '?')}' (hand edits?); "
-                "restoring recorded content anyway (--force)",
+                f"latex-draft: restoring deleted {fname} from the changelog "
+                "(--force)",
                 file=sys.stderr,
             )
+        if current is not None:
+            want = expected.get(fname, entry.get("after_sha256"))
+            if sha256(current) != want:
+                if not force:
+                    skipped.append(fname)
+                    print(
+                        f"latex-draft: skipped '{entry.get('note', '?')}' in "
+                        f"{fname}: the file changed after it (conflict); "
+                        "use --force to restore the recorded content anyway",
+                        file=sys.stderr,
+                    )
+                    continue
+                print(
+                    f"latex-draft: WARNING: {fname} no longer matches the "
+                    f"state after '{entry.get('note', '?')}' (hand edits?); "
+                    "restoring recorded content anyway (--force)",
+                    file=sys.stderr,
+                )
         tmp = target.with_suffix(target.suffix + ".tmp")
+        target.parent.mkdir(parents=True, exist_ok=True)
         write_tex(tmp, entry["before"])
         os.replace(tmp, target)
         done_entries.append(entry)
@@ -2295,7 +2421,7 @@ def cmd_check(tex: Path, state: dict, args: argparse.Namespace) -> int:
         main_text = read_tex(tex)
         leftovers = [
             line.strip()
-            for line in main_text.split("\n")
+            for line in split_lines(main_text)
             if injected_preamble_line(line)
         ]
         if leftovers:
@@ -2509,6 +2635,7 @@ def main(argv: list[str] | None = None) -> int:
         "accept",
         "reject",
         "undo",
+        "repair",
     ):
         state["file_hashes"] = current_hashes(tex)
         save_state(tex, state)

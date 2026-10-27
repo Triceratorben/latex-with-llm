@@ -415,6 +415,8 @@ record whose block is gone is closed instead of lingering as a phantom
 pending draft. If a draft block was hand-deleted from the file,
 `accept --all` / `reject --all` resolve the drafts that still exist and warn
 about the vanished ones; asking for that specific id is an error (exit 2).
+If the user deleted a whole chapter, `undo` reports it and restores nothing
+(exit 1) — `undo --force` recreates the file from the changelog.
 
 ## Backups (automatic)
 
@@ -447,9 +449,12 @@ The user may edit the `.tex` files directly, even mid-turn:
 
 The tool treats `.tex` files as bytes the user owns:
 
-- **Line endings are preserved.** CRLF (Windows) and CR-only (classic Mac)
-  documents survive a draft → accept/reject cycle byte-identically; the tool
-  never rewrites your line endings.
+- **Line endings are preserved.** LF, CRLF (Windows) and CR-only (classic
+  Mac) documents all work. A draft is written with the document's own
+  separator, so the marked-up file the user reviews has no mixed endings;
+  reject restores the exact bytes, and a mixed-EOL file keeps every untouched
+  line as it was. A draft always lands between `\begin{document}` and
+  `\end{document}`, where TeX actually typesets it.
 - **Encoding is UTF-8.** A non-UTF-8 file (e.g. latin-1) is refused with a
   clean error message (`latex-draft: <file> is not valid UTF-8 ...`), not a
   traceback. A UTF-8 BOM is tolerated.

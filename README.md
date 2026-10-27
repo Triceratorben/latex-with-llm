@@ -19,8 +19,11 @@ mid-write (the change is aborted, never clobbered) — and the content hashes ar
 keyed relative to the document, so copying or moving the project is not
 mistaken for a hand edit.
 
-**File fidelity**: CRLF/CR line endings survive a draft cycle byte-identically;
-documents must be UTF-8 (a non-UTF-8 file gets a clean error, not a traceback);
+**File fidelity**: LF, CRLF and CR-only documents all work, and a draft
+inherits the document's own line separators — the marked-up file the user
+reviews is not a mix of endings, and reject restores the exact bytes. A
+document that mixes endings keeps each untouched line as it was. Documents
+must be UTF-8 (a non-UTF-8 file gets a clean error, not a traceback);
 unbalanced braces in drafted text are escaped so accept never truncates; and
 the auto-strip at resolve time removes only the preamble lines the tool itself
 injected — your own `\usepackage{changes}` or `\definechangesauthor` lines are
