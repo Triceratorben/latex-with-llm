@@ -84,6 +84,18 @@ MATH_END_RE = re.compile(
 # \[ ... \] on its own; \\[2mm] (a line break with spacing) must not count.
 MATH_OPEN_RE = re.compile(r"(?<!\\)\\\[")
 MATH_CLOSE_RE = re.compile(r"\\\]")
+# Floats: a margin note cannot go inside one either ("Float(s) lost"), so a
+# note about a change to a float is placed after the float's end.
+FLOAT_ENVIRONMENTS = (
+    "figure", "figure*", "table", "table*", "wrapfigure", "wraptable",
+    "subfigure", "sidewaysfigure", "sidewaystable",
+)
+FLOAT_BEGIN_RE = re.compile(
+    r"\\begin\{(" + "|".join(map(re.escape, FLOAT_ENVIRONMENTS)) + r")\}"
+)
+FLOAT_END_RE = re.compile(
+    r"\\end\{(" + "|".join(map(re.escape, FLOAT_ENVIRONMENTS)) + r")\}"
+)
 
 BLOCK_RE = re.compile(
     r"% latex-draft:([0-9a-f]{8})(?:\r\n|\r|\n)(.*?)"
@@ -182,6 +194,7 @@ def load_state(tex: Path) -> dict:
             state.setdefault("turn", 0)
             state.setdefault("full_backup_done", False)
             state.setdefault("injected_preamble", [])
+            state.setdefault("label_notes", [])
             # Hashes used to be keyed by absolute path; a copied or moved
             # project then looked hand-edited. Re-key them relative to the
             # main file's directory.
@@ -198,6 +211,7 @@ def load_state(tex: Path) -> dict:
         "turn": 0,
         "full_backup_done": False,
         "injected_preamble": [],
+        "label_notes": [],
     }
     if corrupt:
         # The document still carries its draft blocks; recover them from the
@@ -906,6 +920,23 @@ def _has_provenance(tex: Path) -> bool:
     return False
 
 
+def _has_label_notes(tex: Path, state: dict) -> bool:
+    """Whether a note this tool added next to an unmarked label is still there.
+
+    Only notes the tool recorded in the state count: a document that already
+    uses the changes package itself (a co-author's tracked edits) must not
+    keep the injected preamble alive.
+    """
+    notes = state.get("label_notes") or []
+    if not notes:
+        return False
+    for f in watched_files(tex):
+        text = _read_or_none(f)
+        if text and any(note in text for note in notes):
+            return True
+    return False
+
+
 def _provenance_span(text: str, index: int) -> tuple[int, int] | None:
     """Span of the `\\added{...}`/`\\highlight{...}` command containing `index`.
 
@@ -1039,21 +1070,20 @@ def visible_line_indices(lines: list[str], skip_injected: bool = True) -> list[i
     return out
 
 
-def insert_block(
-    text: str,
+def _insert_position(
+    lines: list[str],
     block: str,
     after: str | None = None,
     before: str | None = None,
     at_line: int | None = None,
     marked: bool = True,
-) -> str:
+) -> int:
     """Insert `block` (whole lines) at an anchor.
 
     `marked` says whether the block will be wrapped in the changes markup; an
     unmarked insertion carries none, so it may go where markup cannot (inside
     math, inside a table) — that is how a `\\label` is added.
     """
-    lines = split_lines(text)
     if at_line is not None:
         if at_line < 1:
             raise DraftError(f"--at-line must be >= 1, got {at_line}")
@@ -1127,10 +1157,50 @@ def insert_block(
             "has to sit inside the equation, where \\added cannot be "
             "typeset. Use `draft-insert --unmarked` (no markup, undoable)"
         )
-    # A draft block always occupies whole lines; insert_lines_at terminates
-    # every inserted line with the document's own separator, so the end
-    # marker lands on its own line even at EOF.
+    return pos
+
+
+def insert_block(
+    text: str,
+    block: str,
+    after: str | None = None,
+    before: str | None = None,
+    at_line: int | None = None,
+    marked: bool = True,
+) -> str:
+    """Insert `block` (whole lines) at an anchor.
+
+    A block always occupies whole lines; insert_lines_at terminates every
+    inserted line with the document's own separator, so an end marker lands on
+    its own line even at EOF.
+    """
+    lines = split_lines(text)
+    pos = _insert_position(lines, block, after, before, at_line, marked)
     return insert_lines_at(text, pos, split_lines(block))
+
+
+def _enclosing_end(lines: list[str], pos: int) -> int | None:
+    """Closing line of the innermost math or float environment at `pos`.
+
+    A margin note cannot live inside a float or in math, so a note about such
+    a change goes after the environment's end.
+    """
+    kinds = (
+        (MATH_BEGIN_RE, MATH_END_RE),
+        (MATH_OPEN_RE, MATH_CLOSE_RE),
+        (FLOAT_BEGIN_RE, FLOAT_END_RE),
+    )
+    ends: list[int] = []
+    for begin_re, end_re in kinds:
+        depth = _env_depth(lines, pos, begin_re, end_re)
+        if depth <= 0:
+            continue
+        for i in range(pos, len(lines)):
+            depth += len(begin_re.findall(lines[i])) - len(end_re.findall(lines[i]))
+            if depth <= 0:
+                ends.append(i)
+                break
+    return min(ends) if ends else None
 
 
 def extract_command_contents(block: str, cmd: str) -> list[str]:
@@ -1481,30 +1551,61 @@ def _unmarked_insert(
     r"""Insert raw LaTeX with no draft markup.
 
     For changes the PDF cannot show (a \label on an equation) or that the
-    markup cannot carry (a float environment): there is nothing to review in
-    the PDF, so instead of a draft the change is snapshotted, changelogged
-    and undoable.
+    markup cannot carry (a float environment). An inserted \label also gets a
+    draft-only `\comment` after its environment ("labelled by LLM"), so the
+    review PDF says that something happened; the note is dropped in final
+    mode and removed with the change by `undo`.
     """
+    author = getattr(args, "author", None) or DEFAULT_AUTHOR
+    is_label = args.text.strip().startswith("\\label")
+    note = f"\\comment[id={author}]{{labelled by {author}}}" if is_label else None
     preview = " ".join(args.text.split())[:60]
 
+    # Validate against the target before the main file's preamble is touched.
+    try:
+        _insert_position(
+            split_lines(read_tex(target)), args.text,
+            args.after, args.before, args.at_line, marked=False,
+        )
+    except DraftError as e:
+        return _fail(e)
+    if note and not _same_file(target, tex):
+        ensure_document_preamble(tex, state, author)
+
     def fn(text: str) -> str:
-        return insert_block(
-            text,
-            args.text,
-            after=args.after,
-            before=args.before,
-            at_line=args.at_line,
-            marked=False,
+        if note and _same_file(target, tex):
+            text = _prepare_body_text(text, state, author, tex)
+        lines = split_lines(text)
+        pos = _insert_position(
+            lines, args.text, args.after, args.before, args.at_line, marked=False
+        )
+        label_lines = split_lines(args.text)
+        if note is None:
+            return insert_lines_at(text, pos, label_lines)
+        end = _enclosing_end(lines, pos)
+        note_pos = (end + 1 if end is not None else pos) + len(label_lines)
+        return insert_lines_at(
+            insert_lines_at(text, pos, label_lines), note_pos, [note]
         )
 
     try:
         mutate(tex, state, f"insert without markup: {preview}", fn, target=target)
     except DraftError as e:
         return _fail(e)
-    print(
-        "latex-draft: inserted without markup — it has no visual effect, so "
-        "the PDF will not show it; `undo` reverts it"
-    )
+    if note:
+        # Remember the note so the preamble is not stripped while it exists.
+        state.setdefault("label_notes", []).append(note)
+        save_state(tex, state)
+        print(
+            "latex-draft: inserted without markup, with a note "
+            f"\"labelled by {author}\" next to it — the note shows in draft "
+            "mode and disappears in final mode; `undo` reverts both"
+        )
+    else:
+        print(
+            "latex-draft: inserted without markup — it has no visual effect, "
+            "so the PDF will not show it; `undo` reverts it"
+        )
     return 0
 
 
@@ -2101,6 +2202,9 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
                 if config["keep_markup"] and PROVENANCE_CMD_RE.search(new_text):
                     # The kept markup needs the package to compile.
                     return new_text
+                if _has_label_notes(tex, state):
+                    # A note next to an unmarked label needs it too.
+                    return new_text
                 return strip_changes_package_if_unused(new_text, injected)
             return new_text
 
@@ -2130,10 +2234,12 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
         rec["orphaned_by_overlap"] = True
     # Once no draft markers remain anywhere in the document, strip the
     # auto-injected preamble from the main file (some classes reject the
-    # changes package in final mode) — unless accepted text is still kept
-    # marked, which needs the package to compile.
+    # changes package in final mode) — unless markup the package provides is
+    # still there: accepted text kept marked, or a note for an unmarked label.
     if not any(rec["status"] == "pending" for rec in state["drafts"].values()):
-        if not (config["keep_markup"] and _has_provenance(tex)):
+        if not (config["keep_markup"] and _has_provenance(tex)) and not (
+            _has_label_notes(tex, state)
+        ):
             _strip_unused_preamble(tex, state, injected)
     save_state(tex, state)
     note = ""
@@ -2737,7 +2843,9 @@ def cmd_check(tex: Path, state: dict, args: argparse.Namespace) -> int:
         stray = len(re.findall(r"% latex-draft(-end)?:[0-9a-f]{8}", scrubbed))
         if stray:
             problems.append(f"{f.name}: {stray} stray latex-draft marker line(s)")
-    marked = load_config(tex)["keep_markup"] and _has_provenance(tex)
+    marked = (
+        load_config(tex)["keep_markup"] and _has_provenance(tex)
+    ) or _has_label_notes(tex, state)
     if not pending:
         main_text = read_tex(tex)
         leftovers = [
@@ -2759,9 +2867,10 @@ def cmd_check(tex: Path, state: dict, args: argparse.Namespace) -> int:
           "no leftover preamble")
     if marked and _changes_mode(read_tex(tex)) != "final":
         print(
-            "latex-draft: accepted LLM text is still marked (keep_markup); "
-            "the review PDF shows it. For production, build with "
-            "\\usepackage[final]{changes} so the marks are printed plainly."
+            "latex-draft: changes-package markup is still present (accepted "
+            "text kept marked, or a note for a label); the review PDF shows "
+            "it. For production, build with \\usepackage[final]{changes} so "
+            "the marks and notes are dropped."
         )
     return 0
 

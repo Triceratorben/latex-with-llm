@@ -230,9 +230,13 @@ environment `\added` fails to compile, and after `\end{equation}` it
 compiles but captures an *empty* number (the counter lives inside the
 environment's group), so references print nothing. Use
 `draft-insert --unmarked`: it applies the text with no markup, snapshotted,
-changelogged and undoable, which is right here because a label has no visual
-effect and there is nothing for the PDF to show. Say so when you report the
-change ("label added unmarked; the PDF does not change; `undo` reverts it").
+changelogged and undoable. For a label it also adds a draft-only note next
+to the change — `\comment[id=LLM]{labelled by LLM}`, placed after the
+environment (a margin note cannot live inside a float or in math) — so the
+review PDF says something happened. The note shows in draft mode, disappears
+in final mode, and `undo` removes it together with the label. Say so when you
+report the change ("labelled unmarked; the note marks it in the PDF; `undo`
+reverts both").
 
 Note also that changes with no visible text effect (spacing, sizes) show only
 the author mark in the review PDF, and that a graphic inside `\deleted` is

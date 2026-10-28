@@ -610,20 +610,61 @@ class TestEquationLabels(LoopCase):
             "--text", "\\label{eq:energy}",
         )
         self.assertEqual(rc, 0, err)
-        self.assertIn("no visual effect", out)
+        self.assertIn("labelled by", out)
         body = self.text()
         self.assertLess(body.index("\\begin{equation}"), body.index("\\label{eq:energy}"))
         self.assertLess(body.index("\\label{eq:energy}"), body.index("\\end{equation}"))
+        # the note cannot live in math, so it goes right after the environment
+        self.assertLess(body.index("\\end{equation}"), body.index("labelled by LLM"))
+        self.assertIn("\\comment[id=LLM]{labelled by LLM}", body)
         self.assertNotIn("% latex-draft", body, "an unmarked insert leaves no markers")
         self.assertNotIn("\\added", body)
         self.assertEqual(self.cli("check"), 0)
         self.assertIn("no drafts", self.cli_out("list")[1])
 
-        # recorded as a change, and undoable
+        # recorded as a change, and undoable together with the note
         entries = [e for e in read_changelog(self.tex) if e["kind"] == "change"]
         self.assertTrue(any("without markup" in e["note"] for e in entries))
         self.assertEqual(self.cli("undo"), 0)
         self.assertNotIn("\\label{eq:energy}", self.text())
+        self.assertNotIn("labelled by", self.text())
+
+    def test_the_note_goes_after_the_float_for_a_figure_label(self):
+        self.tex.write_text(
+            "\\documentclass{article}\n"
+            "\\usepackage{graphicx}\n"
+            "\\begin{document}\n"
+            "\\begin{figure}[h]\n"
+            "\\includegraphics[width=0.5\\textwidth]{example-image}\n"
+            "\\caption{A figure.}\n"
+            "\\end{figure}\n"
+            "\\end{document}\n"
+        )
+        rc, out, err = self.cli_out(
+            "draft-insert", "--unmarked", "--after", "\\caption{A figure.}",
+            "--text", "\\label{fig:one}",
+        )
+        self.assertEqual(rc, 0, err)
+        body = self.text()
+        self.assertLess(body.index("\\caption{"), body.index("\\label{fig:one}"))
+        self.assertLess(body.index("\\end{figure}"), body.index("labelled by LLM"))
+        self.assertEqual(self.cli("check"), 0)
+
+    def test_the_preamble_stays_while_the_note_exists(self):
+        rc, out, err = self.cli_out(
+            "draft-insert", "--unmarked", "--after", "E = mc^2",
+            "--text", "\\label{eq:energy}",
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("\\usepackage[draft]{changes}", self.text())
+        # a later draft + accept must not strip the preamble the note needs
+        self.assertEqual(
+            self.cli("draft-insert", "--after", "we conclude.", "--text", "Done."), 0
+        )
+        self.assertEqual(self.cli("accept", "--all"), 0)
+        self.assertIn("\\usepackage[draft]{changes}", self.text())
+        self.assertIn("labelled by LLM", self.text())
+        self.assertEqual(self.cli("check"), 0)
 
 
 class TestEquationLabelCompiles(LoopCase):
@@ -638,15 +679,35 @@ class TestEquationLabelCompiles(LoopCase):
         ).stdout
         return " ".join(out.split())
 
-    def test_adding_the_label_does_not_change_the_pdf(self):
+    def test_adding_the_label_changes_only_the_note(self):
         review = self.pdf_text()
+        self.assertIn("As shown in", review)
         rc, out, err = self.cli_out(
             "draft-insert", "--unmarked", "--after", "E = mc^2",
             "--text", "\\label{eq:energy}",
         )
         self.assertEqual(rc, 0, err)
-        self.assertEqual(self.pdf_text(), review,
-                         "the label changed the page; it has no visual effect")
+        marked = self.pdf_text()
+        self.assertIn("labelled by LLM", marked, "the note is not visible")
+        # the label itself changes nothing on the page
+        for fragment in ("As shown in", "E = mc2", "we conclude."):
+            self.assertIn(fragment, marked)
+        # in final mode the note is dropped and the page is the original again
+        final = self.dir / "final.tex"
+        final.write_text(
+            self.text().replace(
+                "\\usepackage[draft]{changes}", "\\usepackage[final]{changes}"
+            )
+        )
+        self.assertEqual(main([str(final), "compile"]), 0)
+        out = subprocess.run(
+            ["pdftotext", str(final.with_suffix(".pdf")), "-"],
+            capture_output=True,
+            text=True,
+        ).stdout
+        final_text = " ".join(out.split())
+        self.assertNotIn("labelled by", final_text)
+        self.assertIn("E = mc2", final_text)
 
     def test_the_unmarked_label_makes_references_resolve(self):
         self.tex.write_text(

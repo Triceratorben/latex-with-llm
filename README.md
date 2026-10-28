@@ -166,12 +166,16 @@ shows only the author mark, and a graphic inside `\deleted` is shown twice
 without a strike-through — use `changelog` or the source when the PDF is
 inconclusive.
 
-**Labels are the exception with no review surface at all.** A `\label` on an
-equation cannot be marked: inside the environment `\added` fails to compile,
-and after `\end{equation}` it compiles but captures an empty number. Use
-`draft-insert --unmarked --after 'E = mc^2' --text '\label{eq:energy}'`: the
-label is applied with no markup (the PDF cannot show it anyway), still
-snapshotted, changelogged and revertible with `undo`.
+**Labels are the exception with no review surface of their own.** A `\label`
+on an equation cannot be marked: inside the environment `\added` fails to
+compile, and after `\end{equation}` it compiles but captures an empty number.
+Use `draft-insert --unmarked --after 'E = mc^2' --text '\label{eq:energy}'`:
+the label is applied with no markup, still snapshotted, changelogged and
+revertible with `undo`. Next to it the tool adds a draft-only note
+(`\comment[id=LLM]{labelled by LLM}`, after the environment, since a margin
+note cannot live inside a float or in math), so the review PDF says that
+something changed; the note is dropped in final mode and removed with the
+label by `undo`.
 
 Exit codes: `0` success, `1` nothing to do / runtime failure / check failed,
 `2` usage error (unknown draft id, ambiguous anchor, text not found, file
