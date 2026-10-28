@@ -51,6 +51,22 @@ COLOR_ALIASES = {"grey": "gray", "lightgrey": "lightgray", "darkgrey": "darkgray
 # Accepted LLM text, kept marked so the review PDF still shows what the model
 # wrote; the changes package prints it plainly in final mode.
 PROVENANCE_CMD_RE = re.compile(r"\\(?:added|highlight)(?:\[[^\]]*\])?\{")
+# Content that cannot sit inside \added{...}/\deleted{...}: the markup is
+# ulem text markup. Environment boundaries and alignment tabs are compile
+# errors ("Not in outer par mode", "Missing } inserted") that would otherwise
+# surface only after drafting reported success. A plain \\ line break is
+# fine inside the markup; a row break inside a table is not (see
+# _alignment_depth).
+UNMARKABLE_RE = re.compile(r"\\(?:begin|end)\{[^}]*\}|(?<!\\)&")
+ALIGNMENT_ENVIRONMENTS = (
+    "tabular", "tabular*", "tabularx", "tabulary", "array", "longtable",
+)
+ALIGN_BEGIN_RE = re.compile(
+    r"\\begin\{(" + "|".join(map(re.escape, ALIGNMENT_ENVIRONMENTS)) + r")\}"
+)
+ALIGN_END_RE = re.compile(
+    r"\\end\{(" + "|".join(map(re.escape, ALIGNMENT_ENVIRONMENTS)) + r")\}"
+)
 
 BLOCK_RE = re.compile(
     r"% latex-draft:([0-9a-f]{8})(?:\r\n|\r|\n)(.*?)"
@@ -1064,6 +1080,15 @@ def insert_block(
                     f"(lines {block_start + 1}-{i + 1})"
                 )
             block_start = None
+    # A drafted line inside a table would be a table row: the row break cannot
+    # be wrapped in \added/\deleted, so refuse instead of writing a broken
+    # document.
+    if _alignment_depth(lines, pos):
+        raise DraftError(
+            "insertion point is inside a table or array; a drafted line would "
+            "be a table row and cannot be wrapped in \\added/\\deleted. Edit "
+            "the cell by hand (the tool records and adopts hand edits)"
+        )
     # A draft block always occupies whole lines; insert_lines_at terminates
     # every inserted line with the document's own separator, so the end
     # marker lands on its own line even at EOF.
@@ -1433,6 +1458,7 @@ def _insert_draft(
         return 2
 
     def fn(text: str) -> str:
+        _assert_markable(args.text)
         if _same_file(target, tex):
             text = _prepare_body_text(text, state, author, tex, margin)
         return insert_block(
@@ -1513,6 +1539,54 @@ def _line_span(text: str, span: tuple[int, int]) -> tuple[int, int]:
     return start, m.start() if m else len(text)
 
 
+def _line_of(text: str, index: int) -> int:
+    """Line index (0-based) of a character offset."""
+    return len(split_lines(text[:index])) - 1
+
+
+def _alignment_depth(lines: list[str], line_index: int) -> int:
+    """Table/array nesting depth at a line.
+
+    A line inside one is a table row: wrapping it in \\deleted/\\added would
+    put the row break inside the argument, which TeX rejects.
+    """
+    depth = 0
+    for i, line in enumerate(lines):
+        if i == line_index:
+            return depth
+        depth += len(ALIGN_BEGIN_RE.findall(line)) - len(ALIGN_END_RE.findall(line))
+    return depth
+
+
+def _assert_markable(
+    text: str, span: tuple[int, int] | None = None, what: str = "the drafted text"
+) -> None:
+    r"""Refuse content the changes markup cannot wrap.
+
+    \added/\deleted (and \footnote/\todo) are text markup: an environment
+    boundary or an alignment tab inside the argument is a compile error, and
+    so is a table row. Structural edits belong in draft-preamble (preamble)
+    or in a hand edit, which the tool adopts and records.
+
+    `span` narrows the check to part of `text` and enables the table check
+    (callers pass the character span of the line(s) about to be wrapped).
+    """
+    probe = text[span[0] : span[1]] if span is not None else text
+    m = UNMARKABLE_RE.search(probe)
+    if m:
+        raise DraftError(
+            f"{what} contains LaTeX structure ({m.group(0)!r}) that "
+            "\\added/\\deleted cannot wrap; change only the argument inside "
+            "the line, or make this edit by hand"
+        )
+    if span is not None and _alignment_depth(split_lines(text), _line_of(text, span[0])):
+        raise DraftError(
+            "the text is inside a table or array; a row cannot be wrapped in "
+            "\\added/\\deleted. Edit the cell by hand (the tool records and "
+            "adopts hand edits), or draft the change outside the table"
+        )
+
+
 def _assert_body_text(text: str, index: int) -> None:
     r"""Refuse a body draft that lands in the preamble.
 
@@ -1567,11 +1641,11 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
             )
         if host is not None:
             removed = extract_command_content(host.group(2), "deleted")
+            kept = replacement(removed)
+            _assert_markable(removed, what="the replaced text")
+            _assert_markable(kept, what="the new text")
             block = block_for(
-                text,
-                build_block(
-                    did, old=removed, new=replacement(removed) or None, author=author
-                ),
+                text, build_block(did, old=removed, new=kept or None, author=author)
             )
             # BLOCK_RE consumes the trailing newline after the host's end
             # marker, so host.end() is already at a line boundary. A blank
@@ -1607,11 +1681,11 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
         start, stop = _line_span(text, span)
         _assert_body_text(text, start)
         removed = text[start:stop]
+        kept = replacement(removed)
+        _assert_markable(text, (start, stop), "the replaced text")
+        _assert_markable(kept, what="the new text")
         block = block_for(
-            text,
-            build_block(
-                did, old=removed, new=replacement(removed) or None, author=author
-            ),
+            text, build_block(did, old=removed, new=kept or None, author=author)
         )
         return text[:start] + block + text[stop:]
 

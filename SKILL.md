@@ -150,6 +150,21 @@ line(s) in the marked-up source, so the marker comments cannot swallow the
 rest of the line in the review PDF; accept/reject still merge/restore
 exactly the intended text.
 
+**What cannot be drafted.** `\added`/`\deleted` are *text* markup, so the
+tool refuses (exit 2, nothing written) any draft that would put LaTeX
+structure inside them: an environment boundary (`\begin{...}`/`\end{...}`,
+e.g. moving a figure's `[h]` to `[htbp]`, deleting a whole figure, inserting
+an `itemize`), an unescaped alignment `&`, or a line inside a `tabular`/
+`array` (a row break cannot be wrapped). Edits *inside* one line are fine and
+are the intended route for things that are not prose: a figure's
+`width=0.5\textwidth`, `\vspace{...}`, math such as `$x^2$`, or an escaped
+`\&`. Preamble-level changes go through `draft-preamble`; anything else
+structural is a hand edit, which the tool detects, records and backs up.
+Note also that changes with no visible text effect (spacing, sizes) show only
+the author mark in the review PDF, and that a graphic inside `\deleted` is
+shown but not struck through — inspect the `changelog` or the source when the
+PDF is inconclusive.
+
 **Multi-paragraph drafts.** Drafted text may contain blank lines
 (paragraph breaks) — the tool splits them into one `\added`/`\deleted`
 command per paragraph automatically (the `changes` package cannot take a

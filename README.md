@@ -152,6 +152,20 @@ All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
 | `status` | summary: turn, drafts, changes, backups, pdf, inputs, warnings | — |
 | `check` | pre-submission check: no pending drafts, no stray markers, no leftover preamble | — |
 
+**Structural edits are refused, not miscompiled.** `\added`/`\deleted` are
+text markup: an environment boundary (`\begin{figure}`…), an unescaped `&`,
+or a line inside a `tabular`/`array` cannot go inside the argument — TeX
+reports "Not in outer par mode" / "Missing } inserted". Such drafts exit `2`
+and write nothing, instead of producing a document that will not build.
+Edits *inside* one line still work, which covers most non-prose changes:
+`width=0.5\textwidth` → `width=0.9\textwidth`, `\vspace{...}`, math, escaped
+`\&`. Preamble-level changes use `draft-preamble`; other structural edits are
+hand edits (detected, recorded in the changelog, and backed up). Two caveats
+for the review PDF: a change with no visible text effect (spacing, a size)
+shows only the author mark, and a graphic inside `\deleted` is shown twice
+without a strike-through — use `changelog` or the source when the PDF is
+inconclusive.
+
 Exit codes: `0` success, `1` nothing to do / runtime failure / check failed,
 `2` usage error (unknown draft id, ambiguous anchor, text not found, file
 not an input).

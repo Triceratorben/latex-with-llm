@@ -560,6 +560,97 @@ class TestRepairInAChapter(LoopCase):
 
 
 @unittest.skipUnless(HAVE_TEX, "needs latexmk/pdflatex, pdftotext and the LaTeX packages")
+class TestStructuralEditsAreRefused(LoopCase):
+    r"""Not everything can be wrapped in \added/\deleted.
+
+    The changes package is text markup: an environment boundary, an alignment
+    tab, or a table row inside the argument is a compile error that used to
+    appear only after drafting reported success. These are refused up front;
+    edits *inside* a line (a figure's width, a spacing command) still work.
+    """
+
+    doc = (
+        "\\documentclass{article}\n"
+        "\\usepackage{graphicx}\n"
+        "\\begin{document}\n"
+        "Prose line.\n"
+        "\\begin{figure}[h]\n"
+        "\\includegraphics[width=0.5\\textwidth]{example-image}\n"
+        "\\caption{A figure.}\n"
+        "\\end{figure}\n"
+        "\\begin{tabular}{ll}\n"
+        "aaa & bbb \\\\\n"
+        "ccc & ddd \\\\\n"
+        "\\end{tabular}\n"
+        "\\end{document}\n"
+    )
+
+    REFUSED = {
+        "figure placement": ["draft-replace", "--old", "[h]", "--new", "[htbp]"],
+        "delete a figure environment": [
+            "draft-delete", "--old",
+            "\\begin{figure}[h]\n\\includegraphics[width=0.5\\textwidth]{example-image}\n"
+            "\\caption{A figure.}\n\\end{figure}",
+        ],
+        "insert an environment": [
+            "draft-insert", "--after", "Prose line.",
+            "--text", "\\begin{itemize}\\item x\\end{itemize}",
+        ],
+        "replace a table row": ["draft-replace", "--old", "ccc & ddd", "--new", "ccc & eee"],
+        "insert inside the table": ["draft-insert", "--after", "aaa & bbb", "--text", "new & row"],
+        "comment with an alignment tab": ["draft-comment", "--after", "Prose line.", "--text", "a & b"],
+    }
+
+    def test_unmarkable_edits_are_refused_without_touching_the_file(self):
+        before = self.bytes()
+        for name, argv in self.REFUSED.items():
+            with self.subTest(name):
+                rc, out, err = self.cli_out(*argv)
+                self.assertEqual(rc, 2, err)
+                self.assertIn("cannot wrap", err)
+                self.assertEqual(self.bytes(), before, f"{name} modified the file")
+                self.assertEqual(self.cli("list"), 0)
+                self.assertIn("no drafts", self.cli_out("list")[1])
+
+    def test_a_figure_width_can_be_drafted(self):
+        self.assertEqual(
+            self.cli("draft-replace", "--old", "width=0.5\\textwidth",
+                     "--new", "width=0.9\\textwidth"),
+            0,
+        )
+        self.assertIn(
+            "\\deleted[id=LLM]{\\includegraphics[width=0.5\\textwidth]{example-image}}",
+            self.text(),
+        )
+
+    def test_a_spacing_command_can_be_inserted(self):
+        self.assertEqual(
+            self.cli("draft-insert", "--after", "Prose line.", "--text", "\\vspace{1em}"), 0
+        )
+        self.assertIn("\\added[id=LLM]{\\vspace{1em}}", self.text())
+
+    def test_an_escaped_ampersand_is_text(self):
+        self.assertEqual(
+            self.cli("draft-replace", "--old", "Prose", "--new", "Smith \\& Jones"), 0
+        )
+        self.assertIn("\\added[id=LLM]{Smith \\& Jones line.}", self.text())
+
+    def test_a_prose_line_break_can_be_drafted(self):
+        self.assertEqual(
+            self.cli("draft-insert", "--after", "Prose line.", "--text", "one \\\\ two"), 0
+        )
+        self.assertIn("\\added[id=LLM]{one \\\\ two}", self.text())
+
+
+@unittest.skipUnless(HAVE_TEX, "needs latexmk/pdflatex, pdftotext and the LaTeX packages")
+class TestStructuralRefusalKeepsTheDocumentBuildable(LoopCase):
+    doc = TestStructuralEditsAreRefused.doc
+
+    def test_refused_structural_edit_leaves_a_compiling_document(self):
+        self.assertEqual(self.cli("draft-replace", "--old", "[h]", "--new", "[htbp]"), 2)
+        self.assertEqual(self.cli("compile"), 0, "the refused draft broke the build")
+
+
 class TestReviewPdfShowsTheDraft(LoopCase):
     """Only the compiled PDF can confirm the user really sees the change."""
 
