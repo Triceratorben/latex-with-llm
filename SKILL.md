@@ -465,6 +465,15 @@ The tool treats `.tex` files as bytes the user owns:
   lines the tool itself injected (`\usepackage[draft]{changes}`,
   `\definechangesauthor`, `\usepackage{todonotes}`). A `\usepackage{changes}`
   or `\definechangesauthor` you wrote yourself is never touched.
+- **Accepted-text provenance (optional)**: with
+  `[accept] keep_markup = true` in `.latex-draft.cfg` (next to the main
+  file), `accept` leaves the accepted insert/replace text wrapped in
+  `\added[id=LLM]{...}` (or `\highlight`, and in the configured `color`), so
+  the review PDF still shows what the agent wrote. The injected preamble is
+  kept for that, and `check` reports the document clean with a reminder to
+  build production with `\usepackage[final]{changes}`, where the marks
+  vanish and the text prints plainly. Drafting over text that is still
+  marked is refused — the changes package cannot nest `\added`.
 - **Hashes are relative**: state records content hashes relative to the main
   file's directory, so copying, renaming or moving the project does not look
   like a hand edit. A corrupt state file is not fatal: the tool says so and

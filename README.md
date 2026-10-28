@@ -158,6 +158,42 @@ not an input).
 See `SKILL.md` for the full guide: modes, the conversation state machine,
 and the per-state command rules.
 
+## Keeping accepted text marked (optional)
+
+By default `accept` merges a draft without markup. If you want the review PDF
+to keep showing *which* text the LLM wrote, put a `.latex-draft.cfg` next to
+the main file:
+
+```ini
+[accept]
+keep_markup = true     # accepted text stays marked in the source
+color = grey           # xcolor name: grey/gray, green, blue, ... (grey -> gray)
+style = highlight      # "highlight" (wavy underline by default) instead of "added"
+```
+
+Accepted insert/replace text is then left wrapped in the changes markup
+(`\added[id=LLM]{...}`, or `\highlight[...]` with `style = highlight`), and
+the auto-injected `\usepackage[draft]{changes}` is kept so it still compiles.
+That gives the workflow you want:
+
+- **Review**: build normally (`latex-draft compile`) — the accepted LLM text
+  is marked, in the configured color, with the author mark the package adds
+  (`LLM`). Pending drafts are marked the same way; they still carry
+  `% latex-draft` markers in the source.
+- **Production**: switch the line to `\usepackage[final]{changes}` — the
+  `changes` package prints added text plainly and drops deleted text, so the
+  marks disappear from the PDF without touching the prose.
+  `latex-draft check` reports such a document as clean and reminds you of
+  this; it does not call the kept preamble a leftover.
+
+For a background-highlighted look rather than an underline, also load the
+package as `\usepackage[draft,highlightmarkup=background]{changes}` (or add
+`\sethighlightmarkup{background}` after it). The option only affects
+`accept`; drafting and `reject` stay byte-exact. One limitation: drafting
+over text that is still marked is refused, because the `changes` package
+cannot nest `\added{...}` — edit the whole `\added{...}` command instead (or
+accept without the option and mark later).
+
 ## Reducing approval prompts in Mistral Vibe
 
 This skill runs entirely through one shell command —

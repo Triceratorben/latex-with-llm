@@ -22,6 +22,7 @@ Every turn should end with `compile` so the PDF updates.
 from __future__ import annotations
 
 import argparse
+import configparser
 import hashlib
 import json
 import os
@@ -39,6 +40,17 @@ CHANGES_PACKAGE = r"\usepackage[draft]{changes}"
 CHANGES_AUTHOR_RE = re.compile(r"\\definechangesauthor(\[[^\]]*\])?\{[^}]*\}")
 # colors from the changes package palette, cycled per non-default author
 AUTHOR_COLORS = ["blue", "orange", "purple", "brown", "teal", "magenta"]
+
+# Per-document configuration, next to the main file.
+CONFIG_NAME = ".latex-draft.cfg"
+ACCEPT_STYLES = ("added", "highlight")
+DEFAULT_CONFIG = {"keep_markup": False, "color": None, "style": "added"}
+# xcolor knows "gray", not "grey": accept the common spellings so a config
+# cannot break every compile with an undefined color.
+COLOR_ALIASES = {"grey": "gray", "lightgrey": "lightgray", "darkgrey": "darkgray"}
+# Accepted LLM text, kept marked so the review PDF still shows what the model
+# wrote; the changes package prints it plainly in final mode.
+PROVENANCE_CMD_RE = re.compile(r"\\(?:added|highlight)(?:\[[^\]]*\])?\{")
 
 BLOCK_RE = re.compile(
     r"% latex-draft:([0-9a-f]{8})(?:\r\n|\r|\n)(.*?)"
@@ -63,6 +75,48 @@ def _fail(message: object, rc: int = 2) -> int:
     """Report a user-facing error on stderr and return the exit code."""
     print(f"latex-draft: {message}", file=sys.stderr)
     return rc
+
+
+def load_config(tex: Path) -> dict:
+    """Read `.latex-draft.cfg` from the main file's directory.
+
+    ```
+    [accept]
+    keep_markup = true        # keep changes markup on accepted LLM text
+    color = grey              # xcolor name for the LLM author
+    style = highlight         # added (colored underline) or highlight
+    ```
+
+    Missing keys keep their defaults; a malformed value is a clean error, not
+    a traceback (a bad color would otherwise break every compile).
+    """
+    config = dict(DEFAULT_CONFIG)
+    path = tex.parent / CONFIG_NAME
+    if not path.is_file():
+        return config
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path, encoding="utf-8")
+        if parser.has_section("accept"):
+            section = parser["accept"]
+            config["keep_markup"] = section.getboolean("keep_markup", fallback=False)
+            config["color"] = section.get("color", fallback="").strip() or None
+            config["style"] = section.get("style", fallback="added").strip().lower()
+    except (configparser.Error, ValueError) as e:
+        raise DraftError(f"{CONFIG_NAME} is invalid: {e}") from e
+    if config["style"] not in ACCEPT_STYLES:
+        raise DraftError(
+            f"{CONFIG_NAME}: [accept] style must be one of "
+            f"{', '.join(ACCEPT_STYLES)}, got {config['style']!r}"
+        )
+    if config["color"] and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", config["color"]):
+        raise DraftError(
+            f"{CONFIG_NAME}: [accept] color must be an xcolor name "
+            f"(green, gray, blue, ...), got {config['color']!r}"
+        )
+    if config["color"]:
+        config["color"] = COLOR_ALIASES.get(config["color"], config["color"])
+    return config
 
 
 # ---------------------------------------------------------------- state
@@ -204,6 +258,14 @@ def _atomic_write(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     write_tex(tmp, text)
     os.replace(tmp, path)
+
+
+def _read_or_none(path: Path) -> str | None:
+    """Text of a file, or None when it is missing, unreadable or not UTF-8."""
+    try:
+        return read_tex(path)
+    except (OSError, DraftError):
+        return None
 
 
 def newline_of(text: str) -> str:
@@ -595,10 +657,13 @@ def author_line(author: str, color: str | None = None) -> str:
     return rf"\definechangesauthor[name={author}]{{{author}}}"
 
 
-def ensure_changes_package(text: str, author: str = DEFAULT_AUTHOR) -> str:
+def ensure_changes_package(
+    text: str, author: str = DEFAULT_AUTHOR, color: str | None = None
+) -> str:
     """Inject \\usepackage[draft]{changes} plus a \\definechangesauthor for the
-    given author (colored when it is not the default, so alternatives are
-    distinguishable in the PDF). Idempotent."""
+    given author (colored when it is not the default or `color` is given, so
+    alternatives and accepted-text provenance are distinguishable in the
+    PDF). Idempotent."""
     lines = split_lines(text)
     have_pkg = any(
         re.search(r"\\usepackage(\[[^\]]*\])?\{changes\}", line) for line in lines
@@ -625,7 +690,7 @@ def ensure_changes_package(text: str, author: str = DEFAULT_AUTHOR) -> str:
                 insert_at = i + 1
                 break
         text = insert_lines_at(
-            text, insert_at, [author_line(author, _author_color(text, author))]
+            text, insert_at, [author_line(author, color or _author_color(text, author))]
         )
     return text
 
@@ -638,8 +703,10 @@ def ensure_document_preamble(tex: Path, state: dict, author: str, margin: bool =
     Included files cannot carry the preamble, so this runs before a draft is
     placed in a non-main file. Idempotent; recorded through the changelog.
     """
+    config = load_config(tex)
     text = read_tex(tex)
-    new_text = ensure_changes_package(text, author)
+    color = config["color"] if author == DEFAULT_AUTHOR else None
+    new_text = ensure_changes_package(text, author, color)
     if margin:
         new_text = ensure_todonotes_package(new_text)
     if new_text == text:
@@ -757,15 +824,17 @@ def split_paragraphs(text: str) -> list[str]:
 
 
 def _prepare_body_text(
-    text: str, state: dict, author: str, margin: bool = False
+    text: str, state: dict, author: str, tex: Path, margin: bool = False
 ) -> str:
     """Add the changes package (and todonotes) to a main file's preamble.
 
     The injected lines are recorded in the state, so the strip at resolve time
     removes exactly those and never a line the user wrote. `margin` also
-    loads todonotes, for a margin-note comment.
+    loads todonotes, for a margin-note comment; the configured author color
+    applies to the default (LLM) author only, so alternatives keep their own.
     """
-    prepared = ensure_changes_package(text, author)
+    color = load_config(tex)["color"] if author == DEFAULT_AUTHOR else None
+    prepared = ensure_changes_package(text, author, color)
     _record_injected(state, text, prepared)
     if margin:
         with_todo = ensure_todonotes_package(prepared)
@@ -777,6 +846,56 @@ def _prepare_body_text(
 def _marker_block(did: str, body: str) -> str:
     """Wrap a draft body in its `% latex-draft` marker comments."""
     return "\n".join([f"% latex-draft:{did}", body, f"% latex-draft-end:{did}"])
+
+
+def _provenance(text: str, style: str, attrs: str, newline: str) -> str:
+    """Accepted LLM text, kept marked with changes markup.
+
+    In draft mode the text shows the author's color (underline for `added`,
+    highlight for `highlight`); in final mode the changes package prints it
+    plainly, which is what production builds want. One command per paragraph,
+    like the drafted blocks (a blank line cannot sit inside one argument).
+    """
+    flat = text.replace("\r\n", "\n").replace("\r", "\n")
+    parts = [
+        f"\\{style}{attrs}{{{_escape_unbalanced_braces(para)}}}"
+        for para in split_paragraphs(flat)
+    ]
+    return (newline * 2).join(parts)
+
+
+def _has_provenance(tex: Path) -> bool:
+    """Whether any accepted (kept-marked) LLM text is still in the document."""
+    for f in watched_files(tex):
+        text = _read_or_none(f)
+        if text and PROVENANCE_CMD_RE.search(text):
+            return True
+    return False
+
+
+def _provenance_span(text: str, index: int) -> tuple[int, int] | None:
+    """Span of the `\\added{...}`/`\\highlight{...}` command containing `index`.
+
+    The changes package cannot nest its commands, so a draft must not be built
+    inside accepted provenance markup.
+    """
+    for m in PROVENANCE_CMD_RE.finditer(text):
+        if m.start() > index:
+            break
+        depth, i = 1, m.end()
+        while i < len(text) and depth:
+            ch = text[i]
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            i += 1
+        if m.start() <= index < i:
+            return m.start(), i
+    return None
 
 
 def build_block(
@@ -1064,7 +1183,12 @@ def strip_changes_package_if_unused(
 
 
 def resolve_drafts(
-    text: str, ids: set[str], accept: bool, accepted_id: str | None = None
+    text: str,
+    ids: set[str],
+    accept: bool,
+    accepted_id: str | None = None,
+    keep_markup: bool = False,
+    style: str = "added",
 ) -> tuple[str, set[str], set[str]]:
     """Resolve the draft blocks whose ids are in `ids`.
 
@@ -1076,6 +1200,10 @@ def resolve_drafts(
     sibling group, that block (not the first in document order) performs the
     splice, so the text that lands is the one the user picked. On reject,
     the first block of the group splices the original text back.
+
+    With `keep_markup`, accepted text stays wrapped in the changes markup
+    (`style` = added/highlight) so the review PDF still shows the LLM wrote
+    it; final mode prints it plainly.
     """
     found: set[str] = set()
     spliced: set[str] = set()
@@ -1147,7 +1275,12 @@ def resolve_drafts(
                 done_groups.add(key)
                 spliced.add(did)
             if content:
-                return to_newline(content, nl) + (nl if had_nl else "")
+                spliced_text = to_newline(content, nl)
+                if accept and keep_markup:
+                    attrs_match = re.search(r"\\added(\[[^\]]*\])?", m.group(2))
+                    attrs = (attrs_match.group(1) or "") if attrs_match else ""
+                    spliced_text = _provenance(spliced_text, style, attrs, nl)
+                return spliced_text + (nl if had_nl else "")
             return ""
         for cmd in ("footnote", "todo"):
             content = extract_command_content(m.group(2), cmd)
@@ -1301,7 +1434,7 @@ def _insert_draft(
 
     def fn(text: str) -> str:
         if _same_file(target, tex):
-            text = _prepare_body_text(text, state, author, margin)
+            text = _prepare_body_text(text, state, author, tex, margin)
         return insert_block(
             text,
             block_for(text, make_block(did, author)),
@@ -1410,7 +1543,7 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
 
     def fn(text: str) -> str:
         if _same_file(target, tex):
-            text = _prepare_body_text(text, state, author)
+            text = _prepare_body_text(text, state, author, tex)
         # Draft over the visible occurrence of the old text. If a pending
         # draft already replaced it, draft an *alternative* as a sibling
         # block right after the existing one — not nested inside it: the
@@ -1464,6 +1597,12 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
                 "--old text matched 0 times outside pending draft blocks "
                 "(a match that overlaps a block cannot be drafted over; "
                 "resolve that draft first)"
+            )
+        if _provenance_span(text, span[0]) is not None:
+            raise DraftError(
+                "the text is inside accepted LLM markup (\\added/\\highlight), "
+                "which the changes package cannot nest; edit the whole "
+                "\\added{...} command or remove that markup first"
             )
         start, stop = _line_span(text, span)
         _assert_body_text(text, start)
@@ -1739,6 +1878,7 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
     # of that strip brings the lines back, so recover them from the changelog
     # rather than leaving them in the document forever.
     injected = _injected_lines(tex, state)
+    config = load_config(tex)
     for fname, file_ids in by_file.items():
         if not file_ids:
             continue
@@ -1762,7 +1902,12 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
         def fn(text: str, file_ids=all_ids) -> str:
             nonlocal spliced_ids
             new_text, found, spliced = resolve_drafts(
-                text, file_ids, accept, accepted_id=accepted_id
+                text,
+                file_ids,
+                accept,
+                accepted_id=accepted_id,
+                keep_markup=config["keep_markup"],
+                style=config["style"],
             )
             spliced_ids |= spliced
             missing = file_ids - found
@@ -1771,6 +1916,9 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
                     f"draft(s) not found in {fname}: " + ", ".join(sorted(missing))
                 )
             if _same_file(target, tex) and not others_pending:
+                if config["keep_markup"] and PROVENANCE_CMD_RE.search(new_text):
+                    # The kept markup needs the package to compile.
+                    return new_text
                 return strip_changes_package_if_unused(new_text, injected)
             return new_text
 
@@ -1800,9 +1948,11 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
         rec["orphaned_by_overlap"] = True
     # Once no draft markers remain anywhere in the document, strip the
     # auto-injected preamble from the main file (some classes reject the
-    # changes package in final mode).
+    # changes package in final mode) — unless accepted text is still kept
+    # marked, which needs the package to compile.
     if not any(rec["status"] == "pending" for rec in state["drafts"].values()):
-        _strip_unused_preamble(tex, state, injected)
+        if not (config["keep_markup"] and _has_provenance(tex)):
+            _strip_unused_preamble(tex, state, injected)
     save_state(tex, state)
     note = ""
     if sibling_ids:
@@ -2082,7 +2232,7 @@ def cmd_repair(tex: Path, state: dict, args: argparse.Namespace) -> int:
                 tex,
                 state,
                 "repair: inject changes package preamble",
-                lambda text: _prepare_body_text(text, state, DEFAULT_AUTHOR),
+                lambda text: _prepare_body_text(text, state, DEFAULT_AUTHOR, tex),
             )
             fixed += 1
             continue
@@ -2354,6 +2504,14 @@ def cmd_status(tex: Path, state: dict, args: argparse.Namespace) -> int:
     return 0
 
 
+def _changes_mode(text: str) -> str:
+    """How the changes package is loaded: missing, draft (default) or final."""
+    m = re.search(r"\\usepackage(\[[^\]]*\])?\{changes\}", text)
+    if not m:
+        return "missing"
+    return "final" if "final" in (m.group(1) or "") else "draft"
+
+
 def cmd_check(tex: Path, state: dict, args: argparse.Namespace) -> int:
     """Pre-submission check: the document must be clean of draft markup.
 
@@ -2363,6 +2521,12 @@ def cmd_check(tex: Path, state: dict, args: argparse.Namespace) -> int:
     - leftover auto-injected preamble lines (changes/todonotes packages and
       \\definechangesauthor) once nothing is pending — some classes (revtex,
       achemso) reject them in final mode
+
+    Accepted LLM text kept marked (`keep_markup` in the config) is not a
+    leftover: the package must stay loaded for it to compile. `check` then
+    reminds the user to build production with the final mode, where the
+    package prints that text plainly.
+
     Exit code is 0 when clean, 1 when problems were found.
     """
     problems: list[str] = []
@@ -2379,19 +2543,19 @@ def cmd_check(tex: Path, state: dict, args: argparse.Namespace) -> int:
         if rec["status"] == "pending":
             pending_by_file.setdefault(rec.get("file", tex.name), set()).add(did)
     for f in watched_files(tex):
-        try:
-            text = read_tex(f)
-        except (OSError, DraftError):
+        text = _read_or_none(f)
+        if text is None:
             continue
         # the markers of the pending drafts the tool knows about are not
         # stray; only unknown markers are
         scrubbed = text
-        for m in BLOCK_RE.finditer(text):
+        for m in _blocks_by_id(text).values():
             if m.group(1) in pending_by_file.get(f.name, set()):
                 scrubbed = scrubbed.replace(m.group(0), "")
         stray = len(re.findall(r"% latex-draft(-end)?:[0-9a-f]{8}", scrubbed))
         if stray:
             problems.append(f"{f.name}: {stray} stray latex-draft marker line(s)")
+    marked = load_config(tex)["keep_markup"] and _has_provenance(tex)
     if not pending:
         main_text = read_tex(tex)
         leftovers = [
@@ -2399,7 +2563,7 @@ def cmd_check(tex: Path, state: dict, args: argparse.Namespace) -> int:
             for line in split_lines(main_text)
             if injected_preamble_line(line)
         ]
-        if leftovers:
+        if leftovers and not marked:
             problems.append(
                 f"{tex.name}: leftover auto-injected preamble line(s): "
                 + "; ".join(leftovers)
@@ -2411,6 +2575,12 @@ def cmd_check(tex: Path, state: dict, args: argparse.Namespace) -> int:
         return 1
     print("latex-draft: check OK — no pending drafts, no stray markers, "
           "no leftover preamble")
+    if marked and _changes_mode(read_tex(tex)) != "final":
+        print(
+            "latex-draft: accepted LLM text is still marked (keep_markup); "
+            "the review PDF shows it. For production, build with "
+            "\\usepackage[final]{changes} so the marks are printed plainly."
+        )
     return 0
 
 
