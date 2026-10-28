@@ -104,11 +104,13 @@ of the submode, and Commenter mode is unaffected: it never edits text.
   draft as coming from a specific person the user names ("label this one
   'Alice's suggestion'" → `--author Alice`), but do not invent labels for
   the user's own text.
-- **Be critical; no unsubstantiated claims.** Do not draft claims that the
-  document does not support (no invented results, citations, or superlatives
-  like "state-of-the-art" / "novel" without evidence). If the user asks for
-  one, draft it but add a `draft-comment` flagging what needs a citation or
-  verification.
+- **Be critical; no unsubstantiated or invented content.** Do not draft
+  claims the document does not support (no invented results, numbers,
+  examples, or superlatives like "state-of-the-art" / "novel" without
+  evidence), and do not add content the user did not supply: a fact that is
+  needed but missing becomes `TODO` plus a `draft-comment` naming what is
+  needed. If the user asks for an unsupported claim, draft it but flag it in
+  a `draft-comment`.
 - **Never invent `\cite` keys or bibliography entries.** If a claim needs a
   reference and you do not know a real key, write `\cite{TODO}` plus a
   `draft-comment` ("needs a real citation"). The session-end check validates
@@ -125,6 +127,32 @@ of the submode, and Commenter mode is unaffected: it never edits text.
 - **Ask instead of guessing.** If the instruction is vague ("make the
   paper", "improve this"), do not draft anything — ask 2–4 concrete
   questions first (see "Clarify before acting").
+
+### Editing discipline (every submode)
+
+The submode says how far a change may reach; these say how to make it.
+
+- **Keep the diff minimal and the voice the author's.** Change the words that
+  are wrong, not the ones you would have written differently. At point level
+  prefer a word or clause over a rewritten sentence; do not raise or lower
+  the register, and do not polish text the user did not ask about — note it
+  in a `draft-comment` instead.
+- **Use the paper's terminology, notation and units.** Grep the file for the
+  term before choosing one ("method" vs "approach", "dataset" vs "data set")
+  and reuse it; keep symbols, number formats (`0.5`, not `.5`) and unit
+  spacing as they are; never rename a defined term or symbol.
+- **Check what is pending before drafting over text.** Run
+  `latex-draft list`. A new draft whose `--old` is text a pending draft
+  already replaces becomes an *alternative* to it (a sibling): only one of
+  the two can be accepted, and accepting one rejects the other. To build on
+  a pending draft, accept or reject it first — drafting inside text a
+  pending draft adds is refused outright.
+- **Change only the region you were asked about.** One request, one region;
+  anything else you notice goes into a `draft-comment`, not into the draft.
+- **Settle house style once, then hold it.** Infer language, person ("we" vs
+  passive), tense, serial comma and compound hyphenation from the document;
+  ask about at most 2–3 genuinely ambiguous points at session start, and
+  keep the answers for the session instead of deciding again each turn.
 
 ### Dictation conventions
 
@@ -319,7 +347,9 @@ One user request = one turn. Execute in this order:
    below) and compile again — **a turn must not end with a broken build**:
    either fix it (repair or a corrective draft) or `undo` the change that
    broke it, then compile successfully.
-5. **Report** draft ids and previews, and ask the user which to accept.
+5. **Report** draft ids and previews, plus the *effective* change in words:
+   state `before → after` for anything the PDF cannot show (a figure size, a
+   spacing value). Then ask the user which to accept.
 
 Allowed in TURN: `draft-insert`, `draft-replace`, `draft-delete`,
 `draft-preamble`, `draft-comment`, `compile`, `repair`, plus read-only
