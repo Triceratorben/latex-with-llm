@@ -449,6 +449,7 @@ All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
 | `changelog` | show the change log | `--last N` |
 | `status` | summary: turn, drafts, changes, backups, pdf, inputs, warnings | — |
 | `check` | pre-submission check: no pending drafts, no stray markers, no leftover preamble | — |
+| `finalize` | write a clean copy of the sources: corrections kept, markup/notes/markers removed; original untouched | `--out DIR` |
 
 Exit codes: `0` success, `1` nothing to do / runtime failure / check failed,
 `2` usage error (unknown draft id, ambiguous anchor, text not found, file
@@ -490,6 +491,19 @@ run `latex-draft check`. It fails when:
   reject the `changes` package in final mode. (The tool strips these
   automatically when the last draft is resolved; `check` catches leftovers
   from hand edits or crashes.)
+
+When the user wants files to hand over or submit — readable without this
+tool — run `latex-draft finalize [--out DIR]`. It writes a clean copy
+(default `<main>-final/`): accepted corrections materialized (`\added` /
+`\highlight` unwrapped, `\replaced` keeps the new text), `\deleted`,
+`\comment` and `\todo` dropped, markers and the injected preamble removed,
+input files kept at their relative paths, referenced graphics and `.bib`
+copied. It refuses while drafts are pending, and it never touches the
+original or its history — the review loop stays intact on the working copy.
+It does not flatten `\input` into one file and does not prune unused files:
+`latexpand` or `arxivable` do that if the user is preparing an arXiv bundle.
+Say what the copy is and where it is; do not replace the working document
+with it unless the user asks.
 
 ## Change log and undo
 

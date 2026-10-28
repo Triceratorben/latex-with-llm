@@ -151,6 +151,7 @@ All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
 | `changelog` | show the change log | `--last N` |
 | `status` | summary: turn, drafts, changes, backups, pdf, inputs, warnings | — |
 | `check` | pre-submission check: no pending drafts, no stray markers, no leftover preamble | — |
+| `finalize` | write a clean copy of the sources: corrections kept, markup/notes/markers removed; original untouched | `--out DIR` |
 
 **Structural edits are refused, not miscompiled.** `\added`/`\deleted` are
 text markup: an environment boundary (`\begin{figure}`…), an unescaped `&`,
@@ -218,6 +219,34 @@ package as `\usepackage[draft,highlightmarkup=background]{changes}` (or add
 over text that is still marked is refused, because the `changes` package
 cannot nest `\added{...}` — edit the whole `\added{...}` command instead (or
 accept without the option and mark later).
+
+## Finalizing: clean sources for submission
+
+`latex-draft <main.tex> finalize [--out DIR]` writes a second copy of the
+document (default `<main>-final/` next to the main file) in which the
+corrections are materialized and every trace of the tool is gone:
+
+| In the working copy | In the clean copy |
+|---|---|
+| `\added[id=LLM]{text}`, `\highlight{text}` | `text` |
+| `\replaced[id=LLM]{new}{old}` | `new` |
+| `\deleted{text}`, `\comment{...}`, `\todo{...}` | removed |
+| `% latex-draft:<id>` marker lines | removed |
+| injected `\usepackage[draft]{changes}`, `\definechangesauthor`, `\usepackage{todonotes}` | removed |
+
+Input files keep their relative paths, and referenced graphics and `.bib`
+files are copied, so the output builds as-is. It refuses while drafts are
+pending, and it never touches the working copy, its state, changelog or
+backups — the review loop continues there. Because the copy has no markup,
+it builds the same PDF that `changes` in final mode would, but without the
+package.
+
+`finalize` is deliberately not a flattener and does not prune unused files.
+For an arXiv bundle, run [`latexpand`](https://ctan.org/pkg/latexpand) or
+[arxivable](https://github.com/maximelucas/arxivable) on the finalized
+directory: they handle single-file flattening, `\includegraphics`
+normalization and unused-file pruning, but they do not understand the
+`changes` markup, so they cannot materialize the corrections themselves.
 
 ## Reducing approval prompts in Mistral Vibe
 

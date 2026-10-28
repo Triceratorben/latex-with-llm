@@ -2875,6 +2875,172 @@ def cmd_check(tex: Path, state: dict, args: argparse.Namespace) -> int:
     return 0
 
 
+# Markup this tool leaves in a document, and what a final copy does with it.
+TOOL_MARKUP_RE = re.compile(
+    r"\\(added|highlight|deleted|comment|todo|replaced)(?![A-Za-z])(\[[^\]]*\])?"
+)
+GRAPHICS_RE = re.compile(r"\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}")
+BIBLIOGRAPHY_RE = re.compile(r"\\(?:bibliography|addbibresource)\{([^}]+)\}")
+GRAPHICS_EXTENSIONS = (".pdf", ".png", ".jpg", ".jpeg", ".eps", ".ps")
+
+
+def _brace_args(text: str, start: int, count: int) -> tuple[list[str], int] | None:
+    """Read `count` brace arguments starting at `start`, or None if malformed."""
+    args: list[str] = []
+    i = start
+    for _ in range(count):
+        while i < len(text) and text[i] in " \t\n":
+            i += 1
+        if i >= len(text) or text[i] != "{":
+            return None
+        depth, out = 1, []
+        i += 1
+        while i < len(text) and depth:
+            ch = text[i]
+            if ch == "\\" and i + 1 < len(text):
+                out.append(ch)
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            out.append(ch)
+            i += 1
+        if depth:
+            return None
+        args.append("".join(out))
+    return args, i
+
+
+def _strip_markup(text: str, counts: dict[str, int]) -> str:
+    r"""Remove the changes markup, keeping the text that was accepted.
+
+    `\added`/`\highlight` keep their argument, `\replaced` keeps its new text,
+    `\deleted`/`\comment`/`\todo` are dropped entirely. Nested markup is
+    handled recursively; a command whose argument does not parse is left as
+    it is rather than corrupting the file.
+    """
+    out: list[str] = []
+    pos = 0
+    for m in TOOL_MARKUP_RE.finditer(text):
+        if m.start() < pos:
+            continue
+        name = m.group(1)
+        parsed = _brace_args(text, m.end(), 2 if name == "replaced" else 1)
+        if parsed is None:
+            continue
+        args, end = parsed
+        out.append(text[pos : m.start()])
+        if name in ("added", "highlight", "replaced"):
+            out.append(_strip_markup(args[0], counts))
+        counts[name] = counts.get(name, 0) + 1
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _clean_source(text: str, injected: list[str] | None) -> tuple[str, dict[str, int]]:
+    """A document with every trace of this tool removed."""
+    counts: dict[str, int] = {}
+    text = _strip_markup(text, counts)
+    markers = sum(
+        1
+        for line in split_lines(text)
+        if BLOCK_BEGIN_LINE_RE.fullmatch(line) or BLOCK_END_LINE_RE.fullmatch(line)
+    )
+    if markers:
+        counts["marker-line"] = markers
+    text = _drop_lines(
+        text,
+        lambda line: bool(
+            BLOCK_BEGIN_LINE_RE.fullmatch(line) or BLOCK_END_LINE_RE.fullmatch(line)
+        ),
+    )
+    return strip_changes_package_if_unused(text, injected), counts
+
+
+def _referenced_assets(texts: list[str], base: Path) -> list[Path]:
+    """Graphics and bibliographies the cleaned sources refer to."""
+    found: list[Path] = []
+    for text in texts:
+        for m in GRAPHICS_RE.finditer(text):
+            candidate = base / m.group(1).strip()
+            paths = (
+                [candidate]
+                if candidate.suffix
+                else [candidate.with_suffix(ext) for ext in GRAPHICS_EXTENSIONS]
+            )
+            found.extend(p for p in paths if p.is_file())
+        for m in BIBLIOGRAPHY_RE.finditer(text):
+            for name in m.group(1).split(","):
+                candidate = base / name.strip()
+                paths = [candidate] if candidate.suffix else [candidate.with_suffix(".bib")]
+                found.extend(p for p in paths if p.is_file())
+    return found
+
+
+def cmd_finalize(tex: Path, state: dict, args: argparse.Namespace) -> int:
+    """Write a clean copy of the sources: all corrections, no tool traces.
+
+    Accepted text stays, with the markup unwrapped and the notes dropped, so
+    the copy builds the same PDF as `changes` in final mode and can be read
+    (or submitted) without knowing this tool. The original is untouched.
+    Flattening into one file and pruning for arXiv are left to latexpand /
+    arxivable, which do not understand the changes markup.
+    """
+    pending = [
+        did for did, rec in state["drafts"].items() if rec["status"] == "pending"
+    ]
+    if pending:
+        print(
+            f"latex-draft: {len(pending)} draft(s) still pending "
+            f"({', '.join(sorted(pending))}); accept or reject them first — "
+            "their markup is what a clean copy would have to guess at",
+            file=sys.stderr,
+        )
+        return 1
+    out_dir = Path(args.out).expanduser() if args.out else tex.parent / f"{tex.stem}-final"
+    out_dir = out_dir.resolve()
+    injected = _injected_lines(tex, state) or None
+    counts: dict[str, int] = {}
+    cleaned: list[str] = []
+    written = 0
+    for f in watched_files(tex):
+        try:
+            rel = f.resolve().relative_to(tex.parent.resolve())
+        except ValueError:
+            rel = Path(f.name)
+        source, file_counts = _clean_source(read_tex(f), injected)
+        for key, value in file_counts.items():
+            counts[key] = counts.get(key, 0) + value
+        dest = out_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        write_tex(dest, source)
+        cleaned.append(source)
+        written += 1
+    for asset in _referenced_assets(cleaned, tex.parent):
+        try:
+            rel = asset.resolve().relative_to(tex.parent.resolve())
+        except ValueError:
+            rel = Path(asset.name)
+        dest = out_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(asset, dest)
+        written += 1
+    summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "nothing to remove"
+    print(f"latex-draft: clean copy in {out_dir} ({summary}; {written} file(s))")
+    print(
+        f"latex-draft: the original is untouched; build {out_dir / tex.name} "
+        "for submission"
+    )
+    return 0
+
+
 HANDLERS = {
     "draft-insert": cmd_draft_insert,
     "draft-replace": cmd_draft_replace,
@@ -2892,6 +3058,7 @@ HANDLERS = {
     "changelog": cmd_changelog,
     "status": cmd_status,
     "check": cmd_check,
+    "finalize": cmd_finalize,
 }
 
 
@@ -3042,6 +3209,17 @@ def build_parser() -> argparse.ArgumentParser:
         "check",
         help="pre-submission check: no pending drafts, no stray markers, "
         "no leftover changes/todonotes preamble",
+    )
+
+    p = sub.add_parser(
+        "finalize",
+        help="write a clean copy of the sources: corrections kept, markup and "
+        "notes removed, no tool dependency; the original is untouched",
+    )
+    p.add_argument(
+        "--out",
+        default=None,
+        help="output directory (default: <main>-final next to the main file)",
     )
     return parser
 
