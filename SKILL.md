@@ -33,7 +33,8 @@ becomes available directly.)
 ## Modes (declare one at the start of the conversation)
 
 State the active mode in your first reply and stay in it unless the user
-switches. The mode is a promise about *how* you may use the tool.
+switches. For Writer, state the edit submode as well ("Writer, point edits";
+see below). The mode is a promise about *how* you may use the tool.
 **Default: if the user has not picked a mode, act as Writer** (the common
 case for "write/edit my paper" requests); say which mode you assumed.
 
@@ -51,11 +52,44 @@ case for "write/edit my paper" requests); say which mode you assumed.
 
 The tool does not enforce the mode — it is a promise you make. Stay in it.
 
+### Writer submodes: point, sentence, paragraph
+
+Within Writer mode, *how much* of the text you may change is a second
+promise. Declare it with the mode ("Writer, point edits") and stay in it
+until the user asks for more.
+
+1. **Point edits (default).** Only words and phrasing *within* a sentence.
+   Sentence and paragraph structure stays untouched: no sentence is added,
+   removed, split, merged, or reordered, and no paragraph is added, removed,
+   or restructured. This is the default because it is the least destructive
+   way to improve a paper that already exists.
+2. **Sentence-level edits.** Everything in 1, plus whole sentences may be
+   rewritten, inserted, or deleted. Paragraph structure still holds: the
+   paragraphs stay where they are; none is added, removed, or reordered.
+3. **Paragraph-level edits.** Everything in 2, plus whole paragraphs may be
+   drafted, rewritten, or deleted.
+
+**Change the submode only on request.** If an instruction cannot be carried
+out at the current level ("rewrite this paragraph" while doing point edits),
+that instruction *is* the request: name the level it needs ("that is a
+paragraph-level edit") and work at that level for the turn. Never widen
+silently, and never present a wider change as if it were a point edit. If the
+user sets a level for the rest of the session ("let's rewrite section 3"),
+keep it until they say otherwise, and say when you return to the default.
+
+**What this means for drafts.** Point edits are `draft-replace` over the
+phrase, inside one line. Sentence-level edits also use
+`draft-insert`/`draft-delete` for whole sentences. Paragraph-level edits
+draft whole paragraphs, including multi-paragraph text — the tool splits it
+into one `\added`/`\deleted` per paragraph. `draft-preamble` is independent
+of the submode, and Commenter mode is unaffected: it never edits text.
+
 ## Writer best practices (scientific writing)
 
 - **Default to several versions.** Unless the user asks for exactly one,
-  draft 2–3 alternative wordings/structures (e.g. two `draft-replace` drafts
-  with different `--new`, over the same `--old`). Label them with
+  draft 2–3 alternative wordings (or, at sentence/paragraph level,
+  alternative structures) — e.g. two `draft-replace` drafts with different
+  `--new`, over the same `--old`. Label them with
   `--author A`, `--author B`, ... so each alternative gets a distinct color
   in the PDF and can be told apart. Say which you recommend and why.
   Alternatives are **sibling drafts**: draft each one over the same original
