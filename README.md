@@ -6,7 +6,9 @@ document. Every edit is **drafted first**: the change is inserted into the
 [`changes`](https://ctan.org/pkg/changes) package, so the recompiled PDF
 shows exactly what would change. The user inspects the PDF, picks the draft
 (or one of several options) to keep, and the tool merges it into the document
-without markings — or rejects it.
+without markings — or rejects it. Acceptance leaves the prose clean; an
+optional config can keep the accepted text marked instead (see *Keeping
+accepted text marked*).
 
 Every change is recorded in an append-only **changelog** (full content before
 and after, plus which file it touched), so any change can be undone
@@ -56,7 +58,8 @@ refuse-on-conflict** (a change is skipped if the file changed after it;
 check: no pending drafts, no stray `latex-draft:` markers, and no leftover
 auto-injected preamble (which some classes reject in final mode; the tool
 strips it automatically once no drafts remain pending anywhere in the
-document). **Preamble changes** (`\renewcommand{\thesection}{\Roman{section}}`,
+document — unless accepted text kept marked or a label note still needs the
+package). **Preamble changes** (`\renewcommand{\thesection}{\Roman{section}}`,
 `\setlength`, `\captionsetup`, font/geometry) cannot go through the `changes`
 package, so `draft-preamble` drafts them as raw LaTeX between markers in the
 main file's preamble: the PDF shows the effect live, and `accept` merges the
@@ -64,27 +67,35 @@ command verbatim, `reject` removes it.
 
 The skill has two modes, declared at the start of a conversation (see
 `SKILL.md`): **Writer** (drafts actual text changes) and **Commenter** (only
-adds drafted footnotes — never alters the body text). In Writer mode the
-agent follows scientific-writing practices: it defaults to drafting several
-versions, avoids unsubstantiated claims, pushes back when an instruction
+adds drafted footnotes — never alters the body text). Writer has three edit
+depths, also declared up front and widened only on request: **point edits**
+(words and phrasing inside a sentence, the default), **sentence-level**, and
+**paragraph-level**. In Writer mode the agent follows scientific-writing
+practices: it defaults to drafting several versions, keeps the diff minimal
+and the author's voice, uses the paper's own terminology, avoids
+unsubstantiated claims and invented content, pushes back when an instruction
 seems wrong, and asks 2–4 concrete clarifying questions instead of drafting
 when an instruction is too vague (e.g. "make the paper").
 
 At **session end** the agent runs a reference check: it spawns a subagent to
 validate that every `\cite{key}` has a matching bibliography entry (or checks
 them itself if a subagent is unavailable), fixes or flags problems as drafts,
-and finishes with a final `compile` and `status`.
+and finishes with a final `compile` and `status`. When the user wants files
+to hand over or submit, it runs `finalize` (see *Finalizing* below) rather
+than editing the markup out of the working copy.
 
 ## Layout
 
 - `SKILL.md` — the skill guide: the turn protocol an LLM agent follows.
 - `tools/latex_draft.py` — the single editing tool the skill relies on.
 - `examples/paper.tex` — a minimal example document.
-- `tests/` — test suite for the tool (`python3 -m unittest discover -s tests`,
-  plus the standalone reviewer suites: `python3 tests/additional/test_*.py`).
-  `tests/extended/` holds the extended (reviewer 2) suite; it is run by the
-  same discovery command and skips its real-LaTeX tests when no engine or
-  LaTeX packages are installed.
+- `.latex-draft.cfg` (optional, next to the main file) — accept behaviour:
+  keep markup, author color, label style.
+- `tests/README.md` — what each suite covers and the commands to run them;
+  `tests/test_*.py` is the main suite, `tests/extended/` reviewer 2's,
+  `tests/additional/` reviewer 1's standalone scripts. The suite runs with
+  `python3 -m unittest discover -s tests`, plus
+  `python3 tests/additional/test_*.py`.
 
 ## Quick start
 
@@ -116,6 +127,9 @@ python3 tools/latex_draft.py my-paper.tex changelog      # what changed, when
 python3 tools/latex_draft.py my-paper.tex undo --n 1     # revert last change
 python3 tools/latex_draft.py my-paper.tex undo --turn    # revert this turn
 python3 tools/latex_draft.py my-paper.tex backups       # list snapshots
+
+# Hand over or submit: a clean copy, corrections kept, no tool traces
+python3 tools/latex_draft.py my-paper.tex finalize      # -> my-paper-final/
 ```
 
 Requires Python 3.10+ (standard library only). Compiling requires
@@ -155,16 +169,20 @@ All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
 
 **Structural edits are refused, not miscompiled.** `\added`/`\deleted` are
 text markup: an environment boundary (`\begin{figure}`…), an unescaped `&`,
-or a line inside a `tabular`/`array` cannot go inside the argument — TeX
-reports "Not in outer par mode" / "Missing } inserted". Such drafts exit `2`
-and write nothing, instead of producing a document that will not build.
-Edits *inside* one line still work, which covers most non-prose changes:
-`width=0.5\textwidth` → `width=0.9\textwidth`, `\vspace{...}`, math, escaped
-`\&`. Preamble-level changes use `draft-preamble`; other structural edits are
-hand edits (detected, recorded in the changelog, and backed up). Two caveats
-for the review PDF: a change with no visible text effect (spacing, a size)
-shows only the author mark, and a graphic inside `\deleted` is shown twice
-without a strike-through — use `changelog` or the source when the PDF is
+a line inside a `tabular`/`array`, or a line inside display math
+(`equation`, `align`, `\[ … \]`) cannot go inside the argument — TeX reports
+"Not in outer par mode", "Missing } inserted" or "Missing $ inserted". Such
+drafts exit `2` and write nothing, instead of producing a document that will
+not build. Edits *inside* one line still work, which covers most non-prose
+changes: `width=0.5\textwidth` → `width=0.9\textwidth`, `\vspace{...}`, math
+inside a sentence, escaped `\&`. Preamble-level changes use `draft-preamble`;
+content the markup cannot carry at all (a float environment, a label) can be
+applied with `draft-insert --unmarked`, which leaves no markup but is still
+snapshotted, changelogged and undoable. Everything else structural is a hand
+edit (detected, recorded in the changelog, and backed up). Two caveats for
+the review PDF: a change with no visible text effect (spacing, a size) shows
+only the author mark, and a graphic inside `\deleted` is shown twice without
+a strike-through — use `changelog` or the source when the PDF is
 inconclusive.
 
 **Labels are the exception with no review surface of their own.** A `\label`
@@ -239,7 +257,7 @@ files are copied, so the output builds as-is. It refuses while drafts are
 pending, and it never touches the working copy, its state, changelog or
 backups — the review loop continues there. Because the copy has no markup,
 it builds the same PDF that `changes` in final mode would, but without the
-package.
+package. The default output directory (`<main>-final/`) is git-ignored.
 
 `finalize` is deliberately not a flattener and does not prune unused files.
 For an arXiv bundle, run [`latexpand`](https://ctan.org/pkg/latexpand) or

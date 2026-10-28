@@ -222,8 +222,11 @@ an `itemize`), an unescaped alignment `&`, a line inside a `tabular`/
 all. Edits *inside* one line are fine and are the intended route for things
 that are not prose: a figure's `width=0.5\textwidth`, `\vspace{...}`, math
 such as `$x^2$` inside a sentence, or an escaped `\&`. Preamble-level
-changes go through `draft-preamble`; anything else structural is a hand edit,
-which the tool detects, records and backs up.
+changes go through `draft-preamble`. Content the markup cannot carry at all
+— a float environment, a label — goes through `draft-insert --unmarked`: it
+is applied with no markup, snapshot, changelog entry and `undo` intact, and
+the reviewer only sees the note the tool adds. Anything else structural is a
+hand edit, which the tool detects, records and backs up.
 
 **Labels on equations.** `\label{eq:...}` cannot be drafted: inside the
 environment `\added` fails to compile, and after `\end{equation}` it
@@ -354,6 +357,11 @@ One user request = one turn. Execute in this order:
    - All four body-text drafts accept `--file <name.tex>` (multi-file
      documents) and `--author <label>` (distinct color per alternative; see
      best practices). `draft-preamble` always edits the main file.
+   - A label on an equation/figure/table, or content the markup cannot carry
+     (a float environment): `draft-insert --unmarked --after "<anchor>"
+     --text "\label{...}"`. It is applied at once with no markup and reports
+     that `undo` reverts it; for a label it also adds the note that makes the
+     change visible in the PDF (see "Labels on equations").
    - If the instruction is ambiguous (several options), draft **several
      options** (Writer mode: this is the default).
 4. **Compile** (mandatory end of turn): `latex-draft compile`.
@@ -503,7 +511,8 @@ original or its history — the review loop stays intact on the working copy.
 It does not flatten `\input` into one file and does not prune unused files:
 `latexpand` or `arxivable` do that if the user is preparing an arXiv bundle.
 Say what the copy is and where it is; do not replace the working document
-with it unless the user asks.
+with it unless the user asks. `finalize` is allowed in either mode: it does
+not change the document, only writes a copy.
 
 ## Change log and undo
 
@@ -573,7 +582,10 @@ The tool treats `.tex` files as bytes the user owns:
 - **Preamble ownership**: the auto-strip at resolve time removes only the
   lines the tool itself injected (`\usepackage[draft]{changes}`,
   `\definechangesauthor`, `\usepackage{todonotes}`). A `\usepackage{changes}`
-  or `\definechangesauthor` you wrote yourself is never touched.
+  or `\definechangesauthor` you wrote yourself is never touched. The strip is
+  skipped while accepted text is kept marked or a label note is present,
+  since that markup needs the package; `finalize` removes both (and the
+  injected lines) from its clean copy.
 - **Accepted-text provenance (optional)**: with
   `[accept] keep_markup = true` in `.latex-draft.cfg` (next to the main
   file), `accept` leaves the accepted insert/replace text wrapped in
@@ -606,6 +618,10 @@ Before closing a session, finish with a **reference check**:
 4. Run `latex-draft check` (clean pre-submission state), then a final
    `latex-draft compile` so the PDF is up to date, and `latex-draft status`
    to confirm.
+5. If the user wants the files themselves to hand over or submit, run
+   `latex-draft finalize` (see "Pre-submission check"): it writes a clean
+   copy with the corrections materialized and no trace of the tool. The
+   working copy keeps its history and stays the one you keep editing.
 
 ## Rules
 
@@ -616,8 +632,8 @@ Before closing a session, finish with a **reference check**:
 - Anchors (`--after`/`--before`/`--old`) must be unique in the target file;
   keep one sentence per line in the source.
 - Keep drafted LaTeX idiomatic; escape `%`, `&`, `#`, `_` etc. as needed.
-- Do not commit backups, state files, changelogs, or build artifacts (see
-  `.gitignore`).
+- Do not commit backups, state files, changelogs, `finalize` output
+  (`*-final/`) or build artifacts (see `.gitignore`).
 
 ## Reducing approval prompts (Mistral Vibe)
 

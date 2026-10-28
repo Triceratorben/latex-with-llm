@@ -3,6 +3,10 @@ __pycache__/
 .latex-draft-backups/
 *.latex-draft.json
 *.latex-draft-changes.jsonl
+# atomic-write temp files
+*.tex.tmp
+# `finalize` output (a clean copy of the sources)
+*-final/
 *.aux
 *.log
 *.out
