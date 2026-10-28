@@ -13,13 +13,16 @@ loop trustworthy, beyond the per-command behaviour covered elsewhere:
 - the revert path survives the user deleting a file, and only recreates it
   on request;
 - repairing a multi-file paper fixes the chapter the log points at;
-- a nested chapter survives a snapshot -> restore round trip.
+- a nested chapter survives a snapshot -> restore round trip;
+- batches of drafts can be settled a few at a time over several rounds,
+  with the unsettled ones surviving the next round untouched.
 
 Run:  python3 -m unittest discover -s tests
 """
 
 import contextlib
 import io
+import re
 import shutil
 import subprocess
 import tempfile
@@ -302,6 +305,125 @@ class TestNoSilentBlockCorruption(LoopCase):
         rc = self.cli("draft-replace", "--old", "Hello", "--new", "Goodbye")
         self.assertEqual(rc, 2, "editing added text would duplicate it on accept")
         self.assertEqual(self.bytes(), before)
+
+
+class TestIterativeResolution(LoopCase):
+    """Batches settled a few at a time, over several rounds.
+
+    A real session is not one batch of drafts resolved in one go: the user
+    accepts two, rejects one, leaves the rest pending, asks for another
+    change in a later turn (often on text just accepted), and settles more.
+    Pending blocks must survive the later rounds untouched.
+    """
+
+    doc = (
+        "\\documentclass{article}\n"
+        "\\begin{document}\n"
+        "Sentence A.\n"
+        "Sentence B.\n"
+        "Sentence C.\n"
+        "Sentence D.\n"
+        "\\end{document}\n"
+    )
+
+    def draft(self, *argv):
+        rc, out, err = self.cli_out(*argv)
+        self.assertEqual(rc, 0, err)
+        return re.search(r"drafted .*?\b([0-9a-f]{8})\b", out).group(1)
+
+    def status_of(self, did):
+        return load_state(self.tex)["drafts"][did]["status"]
+
+    def assert_block_present(self, *ids):
+        body = self.text()
+        for did in ids:
+            self.assertIn(f"% latex-draft:{did}", body)
+
+    def assert_block_gone(self, *ids):
+        body = self.text()
+        for did in ids:
+            self.assertNotIn(f"% latex-draft:{did}", body)
+
+    def test_batches_settle_over_several_rounds(self):
+        # Round 1: four drafts in one file; accept one, reject one, leave two.
+        insert_a = self.draft(
+            "draft-insert", "--after", "Sentence A.", "--text", "Inserted after A."
+        )
+        replace_b = self.draft("draft-replace", "--old", "Sentence B.", "--new", "Replaced B.")
+        delete_c = self.draft("draft-delete", "--old", "Sentence C.")
+        insert_d = self.draft(
+            "draft-insert", "--after", "Sentence D.", "--text", "Inserted after D."
+        )
+
+        self.assertEqual(self.cli("accept", "--id", insert_a), 0)
+        self.assertEqual(self.cli("reject", "--id", replace_b), 0)
+
+        self.assert_block_gone(insert_a, replace_b)
+        self.assert_block_present(delete_c, insert_d)
+        self.assertEqual(self.status_of(insert_a), "accepted")
+        self.assertEqual(self.status_of(replace_b), "rejected")
+        self.assertEqual(self.status_of(delete_c), "pending")
+        self.assertEqual(self.cli("check"), 1, "two drafts are still pending")
+        self.assertIn("Inserted after A.", self.text())
+        self.assertIn("Sentence B.", self.text(), "the rejected replace was not restored")
+
+        # Round 2: draft on the text accepted a round ago and elsewhere, then
+        # settle in the other order — reject a pending draft, accept a new one.
+        replace_again = self.draft(
+            "draft-replace", "--old", "Inserted after A.", "--new", "Second-round A."
+        )
+        insert_b = self.draft(
+            "draft-insert", "--after", "Sentence B.", "--text", "Second-round B."
+        )
+
+        self.assertEqual(self.cli("reject", "--id", insert_d), 0)
+        self.assertEqual(self.cli("accept", "--id", replace_again), 0)
+
+        self.assert_block_gone(insert_d, replace_again)
+        self.assert_block_present(delete_c, insert_b)
+        self.assertIn("Second-round A.", self.text())
+        self.assertNotIn("Inserted after A.", self.text())
+        self.assertNotIn("Inserted after D.", self.text(), "a rejected draft leaked into the file")
+
+        # Round 3: draft again over the twice-replaced text, then settle the rest.
+        third = self.draft("draft-replace", "--old", "Second-round A.", "--new", "Third-round A.")
+        self.assertEqual(self.cli("accept", "--id", third), 0)
+        self.assert_block_present(delete_c, insert_b)
+
+        self.assertEqual(self.cli("accept", "--all"), 0)
+        self.assertEqual(self.cli("check"), 0)
+
+        self.assertEqual(
+            self.text(),
+            "\\documentclass{article}\n"
+            "\\begin{document}\n"
+            "Sentence A.\n"
+            "Third-round A.\n"
+            "Sentence B.\n"
+            "Second-round B.\n"
+            "Sentence D.\n"
+            "\\end{document}\n",
+        )
+        for did in (insert_a, delete_c, insert_b, replace_again, third):
+            self.assertEqual(self.status_of(did), "accepted", did)
+        for did in (replace_b, insert_d):
+            self.assertEqual(self.status_of(did), "rejected", did)
+
+    def test_changelog_chain_holds_across_rounds(self):
+        """Each recorded change must start from the previous one's result."""
+        first = self.draft("draft-insert", "--after", "Sentence A.", "--text", "One.")
+        second = self.draft("draft-insert", "--after", "Sentence B.", "--text", "Two.")
+        self.assertEqual(self.cli("accept", "--id", first), 0)
+        third = self.draft("draft-replace", "--old", "Sentence C.", "--new", "Three.")
+        self.assertEqual(self.cli("reject", "--id", second), 0)
+        self.assertEqual(self.cli("accept", "--id", third), 0)
+
+        entries = [e for e in read_changelog(self.tex) if e["kind"] == "change"]
+        self.assertEqual(entries[0]["before"], self.doc)
+        for earlier, later in zip(entries, entries[1:]):
+            self.assertEqual(earlier["after_sha256"], later["before_sha256"])
+        self.assertEqual(entries[-1]["after"], self.text())
+        self.assertEqual(self.cli("check"), 0)
 
 
 class TestRevertSafetyNet(LoopCase):
