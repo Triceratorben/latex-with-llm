@@ -560,6 +560,112 @@ class TestRepairInAChapter(LoopCase):
 
 
 @unittest.skipUnless(HAVE_TEX, "needs latexmk/pdflatex, pdftotext and the LaTeX packages")
+class TestEquationLabels(LoopCase):
+    r"""A `\label` on an equation cannot go through the draft loop.
+
+    The label must sit inside the math environment, where \added cannot be
+    typeset ("Missing $ inserted"); placed after \end{equation} it compiles
+    but writes an empty number. Both routes are refused, pointing at
+    `draft-insert --unmarked`, which applies the label with no markup.
+    """
+
+    doc = (
+        "\\documentclass{article}\n"
+        "\\begin{document}\n"
+        "As shown in\n"
+        "\\begin{equation}\n"
+        "E = mc^2\n"
+        "\\end{equation}\n"
+        "we conclude.\n"
+        "\\end{document}\n"
+    )
+
+    def test_a_marked_equation_label_is_refused(self):
+        before = self.bytes()
+        cases = {
+            "inside the equation": ["draft-insert", "--after", "E = mc^2",
+                                    "--text", "\\label{eq:energy}"],
+            "after \\begin{equation}": ["draft-insert", "--after", "\\begin{equation}",
+                                        "--text", "\\label{eq:energy}"],
+            "replacing the formula": ["draft-replace", "--old", "E = mc^2",
+                                      "--new", "E = mc^3"],
+            "after \\end{equation}": ["draft-insert", "--after", "\\end{equation}",
+                                      "--text", "\\label{eq:energy}"],
+        }
+        for name, argv in cases.items():
+            with self.subTest(name):
+                rc, out, err = self.cli_out(*argv)
+                self.assertEqual(rc, 2, err)
+                self.assertEqual(self.bytes(), before, f"{name} modified the file")
+        # the two in-math cases name the problem; the after-environment case
+        # names the empty-number trap
+        self.assertIn("display math", self.cli_out(
+            "draft-insert", "--after", "E = mc^2", "--text", "\\label{x}")[2])
+        self.assertIn("empty number", self.cli_out(
+            "draft-insert", "--after", "\\end{equation}", "--text", "\\label{x}")[2])
+
+    def test_the_unmarked_insert_adds_the_label_inside_the_equation(self):
+        rc, out, err = self.cli_out(
+            "draft-insert", "--unmarked", "--after", "E = mc^2",
+            "--text", "\\label{eq:energy}",
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("no visual effect", out)
+        body = self.text()
+        self.assertLess(body.index("\\begin{equation}"), body.index("\\label{eq:energy}"))
+        self.assertLess(body.index("\\label{eq:energy}"), body.index("\\end{equation}"))
+        self.assertNotIn("% latex-draft", body, "an unmarked insert leaves no markers")
+        self.assertNotIn("\\added", body)
+        self.assertEqual(self.cli("check"), 0)
+        self.assertIn("no drafts", self.cli_out("list")[1])
+
+        # recorded as a change, and undoable
+        entries = [e for e in read_changelog(self.tex) if e["kind"] == "change"]
+        self.assertTrue(any("without markup" in e["note"] for e in entries))
+        self.assertEqual(self.cli("undo"), 0)
+        self.assertNotIn("\\label{eq:energy}", self.text())
+
+
+class TestEquationLabelCompiles(LoopCase):
+    doc = TestEquationLabels.doc
+
+    def pdf_text(self):
+        self.assertEqual(self.cli("compile"), 0)
+        out = subprocess.run(
+            ["pdftotext", str(self.tex.with_suffix(".pdf")), "-"],
+            capture_output=True,
+            text=True,
+        ).stdout
+        return " ".join(out.split())
+
+    def test_adding_the_label_does_not_change_the_pdf(self):
+        review = self.pdf_text()
+        rc, out, err = self.cli_out(
+            "draft-insert", "--unmarked", "--after", "E = mc^2",
+            "--text", "\\label{eq:energy}",
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.pdf_text(), review,
+                         "the label changed the page; it has no visual effect")
+
+    def test_the_unmarked_label_makes_references_resolve(self):
+        self.tex.write_text(
+            "\\documentclass{article}\n\\begin{document}\n"
+            "As shown in Equation~\\ref{eq:energy}.\n"
+            "\\begin{equation}\nE = mc^2\n\\end{equation}\n"
+            "\\end{document}\n"
+        )
+        self.assertIn("??", self.pdf_text(), "the equation is unlabelled")
+        rc, out, err = self.cli_out(
+            "draft-insert", "--unmarked", "--after", "E = mc^2",
+            "--text", "\\label{eq:energy}",
+        )
+        self.assertEqual(rc, 0, err)
+        text = self.pdf_text()
+        self.assertIn("Equation 1", text)
+        self.assertNotIn("??", text)
+
+
 class TestStructuralEditsAreRefused(LoopCase):
     r"""Not everything can be wrapped in \added/\deleted.
 

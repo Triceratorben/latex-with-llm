@@ -67,6 +67,23 @@ ALIGN_BEGIN_RE = re.compile(
 ALIGN_END_RE = re.compile(
     r"\\end\{(" + "|".join(map(re.escape, ALIGNMENT_ENVIRONMENTS)) + r")\}"
 )
+# Display math: \added/\deleted are text markup, so they cannot be typeset in
+# math mode ("Missing $ inserted"). A label or a formula edit therefore has to
+# happen outside the environment, or by hand.
+MATH_ENVIRONMENTS = (
+    "equation", "equation*", "align", "align*", "alignat", "alignat*",
+    "flalign", "flalign*", "gather", "gather*", "multline", "multline*",
+    "eqnarray", "eqnarray*", "displaymath", "math",
+)
+MATH_BEGIN_RE = re.compile(
+    r"\\begin\{(" + "|".join(map(re.escape, MATH_ENVIRONMENTS)) + r")\}"
+)
+MATH_END_RE = re.compile(
+    r"\\end\{(" + "|".join(map(re.escape, MATH_ENVIRONMENTS)) + r")\}"
+)
+# \[ ... \] on its own; \\[2mm] (a line break with spacing) must not count.
+MATH_OPEN_RE = re.compile(r"(?<!\\)\\\[")
+MATH_CLOSE_RE = re.compile(r"\\\]")
 
 BLOCK_RE = re.compile(
     r"% latex-draft:([0-9a-f]{8})(?:\r\n|\r|\n)(.*?)"
@@ -1028,7 +1045,14 @@ def insert_block(
     after: str | None = None,
     before: str | None = None,
     at_line: int | None = None,
+    marked: bool = True,
 ) -> str:
+    """Insert `block` (whole lines) at an anchor.
+
+    `marked` says whether the block will be wrapped in the changes markup; an
+    unmarked insertion carries none, so it may go where markup cannot (inside
+    math, inside a table) — that is how a `\\label` is added.
+    """
     lines = split_lines(text)
     if at_line is not None:
         if at_line < 1:
@@ -1082,12 +1106,26 @@ def insert_block(
             block_start = None
     # A drafted line inside a table would be a table row: the row break cannot
     # be wrapped in \added/\deleted, so refuse instead of writing a broken
-    # document.
-    if _alignment_depth(lines, pos):
+    # document. An unmarked insertion carries no markup, so it is allowed.
+    if marked and _alignment_depth(lines, pos):
         raise DraftError(
             "insertion point is inside a table or array; a drafted line would "
             "be a table row and cannot be wrapped in \\added/\\deleted. Edit "
             "the cell by hand (the tool records and adopts hand edits)"
+        )
+    if marked and _math_depth(lines, pos):
+        raise DraftError(
+            "insertion point is inside display math, where \\added/\\deleted "
+            "cannot be typeset. Add a label with `draft-insert --unmarked` "
+            "(no markup, undoable); change a formula by hand"
+        )
+    if marked and "\\label" in block and pos and MATH_END_RE.fullmatch(lines[pos - 1].strip()):
+        # The counter lives inside the environment's group: a label after
+        # \end{equation} compiles but writes an empty number.
+        raise DraftError(
+            "a \\label after \\end{equation} would capture an empty number; it "
+            "has to sit inside the equation, where \\added cannot be "
+            "typeset. Use `draft-insert --unmarked` (no markup, undoable)"
         )
     # A draft block always occupies whole lines; insert_lines_at terminates
     # every inserted line with the document's own separator, so the end
@@ -1437,6 +1475,39 @@ def _apply_draft(
     return 0
 
 
+def _unmarked_insert(
+    tex: Path, state: dict, target: Path, args: argparse.Namespace
+) -> int:
+    r"""Insert raw LaTeX with no draft markup.
+
+    For changes the PDF cannot show (a \label on an equation) or that the
+    markup cannot carry (a float environment): there is nothing to review in
+    the PDF, so instead of a draft the change is snapshotted, changelogged
+    and undoable.
+    """
+    preview = " ".join(args.text.split())[:60]
+
+    def fn(text: str) -> str:
+        return insert_block(
+            text,
+            args.text,
+            after=args.after,
+            before=args.before,
+            at_line=args.at_line,
+            marked=False,
+        )
+
+    try:
+        mutate(tex, state, f"insert without markup: {preview}", fn, target=target)
+    except DraftError as e:
+        return _fail(e)
+    print(
+        "latex-draft: inserted without markup — it has no visual effect, so "
+        "the PDF will not show it; `undo` reverts it"
+    )
+    return 0
+
+
 def _insert_draft(
     tex: Path,
     state: dict,
@@ -1456,6 +1527,8 @@ def _insert_draft(
     target = resolve_target(tex, getattr(args, "file", None))
     if target is None:
         return 2
+    if getattr(args, "unmarked", False):
+        return _unmarked_insert(tex, state, target, args)
 
     def fn(text: str) -> str:
         _assert_markable(args.text)
@@ -1544,18 +1617,42 @@ def _line_of(text: str, index: int) -> int:
     return len(split_lines(text[:index])) - 1
 
 
+def _env_depth(
+    lines: list[str], line_index: int, begin_re: re.Pattern, end_re: re.Pattern
+) -> int:
+    """Nesting depth of the environments matched by `begin_re`/`end_re`."""
+    depth = 0
+    for i, line in enumerate(lines):
+        if i == line_index:
+            return depth
+        depth += len(begin_re.findall(line)) - len(end_re.findall(line))
+    return depth
+
+
 def _alignment_depth(lines: list[str], line_index: int) -> int:
     """Table/array nesting depth at a line.
 
     A line inside one is a table row: wrapping it in \\deleted/\\added would
     put the row break inside the argument, which TeX rejects.
     """
-    depth = 0
-    for i, line in enumerate(lines):
-        if i == line_index:
-            return depth
-        depth += len(ALIGN_BEGIN_RE.findall(line)) - len(ALIGN_END_RE.findall(line))
+    return _env_depth(lines, line_index, ALIGN_BEGIN_RE, ALIGN_END_RE)
+
+
+def _math_depth(lines: list[str], line_index: int) -> int:
+    r"""Display-math nesting at a line (equation/align/... and \[ ... \]).
+
+    A line inside math mode cannot carry \added/\deleted: the markup is text
+    markup and TeX answers "Missing $ inserted".
+    """
+    depth = _env_depth(lines, line_index, MATH_BEGIN_RE, MATH_END_RE)
+    for line in lines[:line_index]:
+        depth += len(MATH_OPEN_RE.findall(line)) - len(MATH_CLOSE_RE.findall(line))
     return depth
+
+
+def _line_has_math_delimiter(line: str) -> bool:
+    """Whether the line itself opens or closes display math."""
+    return bool(MATH_OPEN_RE.search(line) or MATH_CLOSE_RE.search(line))
 
 
 def _assert_markable(
@@ -1585,6 +1682,17 @@ def _assert_markable(
             "\\added/\\deleted. Edit the cell by hand (the tool records and "
             "adopts hand edits), or draft the change outside the table"
         )
+    if span is not None:
+        lines = split_lines(text)
+        line_index = _line_of(text, span[0])
+        if _math_depth(lines, line_index) or _line_has_math_delimiter(lines[line_index]):
+            raise DraftError(
+                "the text is inside display math, where \\added/\\deleted "
+                "cannot be typeset (\"Missing $ inserted\"). To add a label, "
+                "draft it after the closing \\end{equation}; to change a "
+                "formula, make the edit by hand (the tool records and adopts "
+                "hand edits)"
+            )
 
 
 def _assert_body_text(text: str, index: int) -> None:
@@ -2712,6 +2820,13 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--before", help="unique line content to insert before")
     g.add_argument("--at-line", type=int, help="1-based line number to insert before")
     p.add_argument("--text", required=True, help="LaTeX text to insert (drafted)")
+    p.add_argument(
+        "--unmarked",
+        action="store_true",
+        help="insert without changes markup: for content the PDF cannot show "
+        "(a \\label on an equation) or that the markup cannot carry (a float "
+        "environment). The change is snapshotted, changelogged and undoable.",
+    )
     add_file_option(p, p)
     add_author_option(p, p)
 

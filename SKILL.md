@@ -216,12 +216,24 @@ exactly the intended text.
 tool refuses (exit 2, nothing written) any draft that would put LaTeX
 structure inside them: an environment boundary (`\begin{...}`/`\end{...}`,
 e.g. moving a figure's `[h]` to `[htbp]`, deleting a whole figure, inserting
-an `itemize`), an unescaped alignment `&`, or a line inside a `tabular`/
-`array` (a row break cannot be wrapped). Edits *inside* one line are fine and
-are the intended route for things that are not prose: a figure's
-`width=0.5\textwidth`, `\vspace{...}`, math such as `$x^2$`, or an escaped
-`\&`. Preamble-level changes go through `draft-preamble`; anything else
-structural is a hand edit, which the tool detects, records and backs up.
+an `itemize`), an unescaped alignment `&`, a line inside a `tabular`/
+`array` (a row break cannot be wrapped), or a line inside display math
+(`equation`, `align`, `\[ ... \]`), where the markup cannot be typeset at
+all. Edits *inside* one line are fine and are the intended route for things
+that are not prose: a figure's `width=0.5\textwidth`, `\vspace{...}`, math
+such as `$x^2$` inside a sentence, or an escaped `\&`. Preamble-level
+changes go through `draft-preamble`; anything else structural is a hand edit,
+which the tool detects, records and backs up.
+
+**Labels on equations.** `\label{eq:...}` cannot be drafted: inside the
+environment `\added` fails to compile, and after `\end{equation}` it
+compiles but captures an *empty* number (the counter lives inside the
+environment's group), so references print nothing. Use
+`draft-insert --unmarked`: it applies the text with no markup, snapshotted,
+changelogged and undoable, which is right here because a label has no visual
+effect and there is nothing for the PDF to show. Say so when you report the
+change ("label added unmarked; the PDF does not change; `undo` reverts it").
+
 Note also that changes with no visible text effect (spacing, sizes) show only
 the author mark in the review PDF, and that a graphic inside `\deleted` is
 shown but not struck through — inspect the `changelog` or the source when the
@@ -417,7 +429,7 @@ All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
 
 | Command | Purpose | Key options |
 |---|---|---|
-| `draft-insert` | draft inserting text at an anchor | `--after` / `--before` / `--at-line N` (exactly one), `--text`, `--file`, `--author` |
+| `draft-insert` | draft inserting text at an anchor | `--after` / `--before` / `--at-line N` (exactly one), `--text`, `--file`, `--author`, `--unmarked` (no markup: for labels or content the PDF cannot show) |
 | `draft-replace` | draft replacing existing text | `--old` (unique), `--new`, `--file`, `--author` |
 | `draft-delete` | draft deleting existing text | `--old` (unique), `--file`, `--author` |
 | `draft-comment` | draft a comment at an anchor (Commenter mode) | `--after` / `--before` / `--at-line N`, `--text`, `--file`, `--author`, `--margin` |

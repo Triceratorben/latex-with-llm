@@ -135,7 +135,7 @@ All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
 
 | Command | Purpose | Key options |
 |---|---|---|
-| `draft-insert` | draft inserting text at an anchor | `--after` / `--before` / `--at-line N` (exactly one), `--text`, `--file`, `--author` |
+| `draft-insert` | draft inserting text at an anchor | `--after` / `--before` / `--at-line N` (exactly one), `--text`, `--file`, `--author`, `--unmarked` |
 | `draft-replace` | draft replacing existing text | `--old` (unique), `--new`, `--file`, `--author` |
 | `draft-delete` | draft deleting existing text | `--old` (unique), `--file`, `--author` |
 | `draft-comment` | draft a comment at an anchor (Commenter mode) | `--after` / `--before` / `--at-line N`, `--text`, `--file`, `--author`, `--margin` |
@@ -165,6 +165,13 @@ for the review PDF: a change with no visible text effect (spacing, a size)
 shows only the author mark, and a graphic inside `\deleted` is shown twice
 without a strike-through — use `changelog` or the source when the PDF is
 inconclusive.
+
+**Labels are the exception with no review surface at all.** A `\label` on an
+equation cannot be marked: inside the environment `\added` fails to compile,
+and after `\end{equation}` it compiles but captures an empty number. Use
+`draft-insert --unmarked --after 'E = mc^2' --text '\label{eq:energy}'`: the
+label is applied with no markup (the PDF cannot show it anyway), still
+snapshotted, changelogged and revertible with `undo`.
 
 Exit codes: `0` success, `1` nothing to do / runtime failure / check failed,
 `2` usage error (unknown draft id, ambiguous anchor, text not found, file
