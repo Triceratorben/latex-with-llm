@@ -254,7 +254,9 @@ def _recover_pending_drafts(tex: Path, state: dict) -> int:
                 or extract_command_content(body, "deleted")
                 or body
             )
-            rec = draft_record(did, "unknown", preview)
+            rec = draft_record(
+                did, "unknown", preview, block_number=_next_block_number(state)
+            )
             rec["file"] = f.name
             rec["recovered"] = True
             state["drafts"][did] = rec
@@ -962,11 +964,25 @@ def _provenance_span(text: str, index: int) -> tuple[int, int] | None:
     return None
 
 
+def _block_sup(n: int) -> str:
+    """A superscript block number for the start of drafted text."""
+    return f"\\textsuperscript{{{n}}}"
+
+
+BLOCK_SUP_RE = re.compile(r"^\\textsuperscript\{[0-9]+\}\s+")
+
+
+def _strip_block_sup(text: str) -> str:
+    """Remove the leading \\textsuperscript{N} block marker from accepted text."""
+    return BLOCK_SUP_RE.sub("", text, count=1)
+
+
 def build_block(
     did: str,
     old: str | None = None,
     new: str | None = None,
     author: str = DEFAULT_AUTHOR,
+    block_number: int | None = None,
 ) -> str:
     parts = [f"% latex-draft:{did}"]
     if old is not None:
@@ -976,16 +992,19 @@ def build_block(
             )
             parts.append("")
     if new is not None:
-        for para in split_paragraphs(new):
+        for i, para in enumerate(split_paragraphs(new)):
+            prefix = _block_sup(block_number) + " " if (block_number and i == 0) else ""
             parts.append(
-                rf"\added[id={author}]{{{_escape_unbalanced_braces(para)}}}"
+                rf"\added[id={author}]{{{prefix}{_escape_unbalanced_braces(para)}}}"
             )
             parts.append("")
     parts.append(f"% latex-draft-end:{did}")
     return "\n".join(parts)
 
 
-def build_comment_block(did: str, text: str, margin: bool = False) -> str:
+def build_comment_block(
+    did: str, text: str, margin: bool = False, block_number: int | None = None
+) -> str:
     """A commenter-mode draft that never alters the body text.
 
     Default is a footnote; with margin=True a todonotes margin note, which is
@@ -993,17 +1012,19 @@ def build_comment_block(did: str, text: str, margin: bool = False) -> str:
     and does not shift pagination.
     """
     safe = _escape_unbalanced_braces(text)
+    if block_number:
+        safe = _block_sup(block_number) + " " + safe
     cmd = "\\todo" if margin else "\\footnote"
     return _marker_block(did, f"{cmd}{{{safe}}}")
 
 
-def build_preamble_block(did: str, text: str) -> str:
+def build_preamble_block(did: str, text: str, block_number: int | None = None) -> str:
     """A preamble draft block: raw LaTeX between marker comments, NOT
     wrapped in \\added/\\deleted.
 
     Preamble commands (\\renewcommand, \\setlength, \\captionsetup, ...)
     cannot go through the changes package: \\added typesets its argument
-    immediately (\"Missing \\begin{document}\" in the preamble), expands it
+    immediately ("Missing \\begin{document}" in the preamble), expands it
     with \\protected@edef (freezing counter references like \\Roman{section}
     at definition time), and opens a group (so body-level \\def is discarded).
     The raw text is still marked, backed up, changelogged, and tracked as a
@@ -1408,7 +1429,7 @@ def resolve_drafts(
                 done_groups.add(key)
                 spliced.add(did)
             if content:
-                spliced_text = to_newline(content, nl)
+                spliced_text = to_newline(_strip_block_sup(content), nl)
                 if accept and keep_markup:
                     attrs_match = re.search(r"\\added(\[[^\]]*\])?", m.group(2))
                     attrs = (attrs_match.group(1) or "") if attrs_match else ""
@@ -1420,7 +1441,7 @@ def resolve_drafts(
             if content is not None:
                 if not accept:
                     return ""
-                out = "\\" + cmd + "{" + to_newline(content, nl) + "}"
+                out = "\\" + cmd + "{" + to_newline(_strip_block_sup(content), nl) + "}"
                 return out + (nl if had_nl else "")
         return ""
 
@@ -1445,15 +1466,26 @@ def _blocks_by_id(text: str) -> dict[str, re.Match]:
     return blocks
 
 
-def draft_record(did: str, op: str, preview_text: str) -> dict:
+def _next_block_number(state: dict) -> int:
+    """1-based ordinal of the next draft block, in creation order."""
+    nums = [r.get("block", 0) for r in state["drafts"].values()]
+    return (max(nums) if nums else 0) + 1
+
+
+def draft_record(
+    did: str, op: str, preview_text: str, block_number: int | None = None
+) -> dict:
     preview = " ".join(preview_text.split())[:120]
-    return {
+    rec = {
         "id": did,
         "op": op,
         "status": "pending",
         "created": now(),
         "preview": preview,
     }
+    if block_number is not None:
+        rec["block"] = block_number
+    return rec
 
 
 def mutate(tex: Path, state: dict, note: str, fn, target: Path | None = None) -> Path:
@@ -1537,7 +1569,7 @@ def _apply_draft(
         mutate(tex, state, f"draft {op} {did}", fn, target=target)
     except DraftError as e:
         return _fail(e)
-    record = draft_record(did, op, preview)
+    record = draft_record(did, op, preview, block_number=_next_block_number(state))
     record.update({"file": target.name, "author": author, **(fields or {})})
     state["drafts"][did] = record
     save_state(tex, state)
@@ -1625,6 +1657,7 @@ def _insert_draft(
     """
     did = new_id(state)
     author = getattr(args, "author", None) or DEFAULT_AUTHOR
+    block_number = _next_block_number(state)
     target = resolve_target(tex, getattr(args, "file", None))
     if target is None:
         return 2
@@ -1637,7 +1670,7 @@ def _insert_draft(
             text = _prepare_body_text(text, state, author, tex, margin)
         return insert_block(
             text,
-            block_for(text, make_block(did, author)),
+            block_for(text, make_block(did, author, block_number)),
             after=args.after,
             before=args.before,
             at_line=args.at_line,
@@ -1652,7 +1685,7 @@ def _insert_draft(
 def cmd_draft_insert(tex: Path, state: dict, args: argparse.Namespace) -> int:
     return _insert_draft(
         tex, state, args, "insert",
-        lambda did, author: build_block(did, new=args.text, author=author),
+        lambda did, author, bn: build_block(did, new=args.text, author=author, block_number=bn),
     )
 
 
@@ -1854,7 +1887,7 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
             _assert_markable(removed, what="the replaced text")
             _assert_markable(kept, what="the new text")
             block = block_for(
-                text, build_block(did, old=removed, new=kept or None, author=author)
+                text, build_block(did, old=removed, new=kept or None, author=author, block_number=_next_block_number(state))
             )
             # BLOCK_RE consumes the trailing newline after the host's end
             # marker, so host.end() is already at a line boundary. A blank
@@ -1894,7 +1927,7 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
         _assert_markable(text, (start, stop), "the replaced text")
         _assert_markable(kept, what="the new text")
         block = block_for(
-            text, build_block(did, old=removed, new=kept or None, author=author)
+            text, build_block(did, old=removed, new=kept or None, author=author, block_number=_next_block_number(state))
         )
         return text[:start] + block + text[stop:]
 
@@ -1928,7 +1961,7 @@ def cmd_draft_comment(tex: Path, state: dict, args: argparse.Namespace) -> int:
     margin = getattr(args, "margin", False)
     return _insert_draft(
         tex, state, args, "comment",
-        lambda did, author: build_comment_block(did, args.text, margin=margin),
+        lambda did, author, bn: build_comment_block(did, args.text, margin=margin, block_number=bn),
         margin=margin, fields={"margin": margin},
     )
 
@@ -1998,7 +2031,7 @@ def cmd_draft_preamble(tex: Path, state: dict, args: argparse.Namespace) -> int:
                     "(need exactly 1)"
                 )
             pos = hits[0] + 1
-        block = block_for(text, build_preamble_block(did, text_arg))
+        block = block_for(text, build_preamble_block(did, text_arg, block_number=_next_block_number(state)))
         return insert_lines_at(text, pos, split_lines(block))
 
     return _apply_draft(
@@ -2012,9 +2045,14 @@ def cmd_list(tex: Path, state: dict, args: argparse.Namespace) -> int:
     if not drafts:
         print("latex-draft: no drafts")
         return 0
-    for did, rec in sorted(drafts.items(), key=lambda kv: kv[1]["created"]):
+    def _sort_key(kv):
+        rec = kv[1]
+        return (rec.get("block", 0), rec["created"])
+
+    for did, rec in sorted(drafts.items(), key=_sort_key):
+        block = f"#{rec['block']}" if "block" in rec else "#-"
         print(
-            f"{did}  {rec['status']:<8}  {rec['op']:<7}  "
+            f"{block:<4} {did}  {rec['status']:<8}  {rec['op']:<7}  "
             f"{rec['created']}  {rec['preview']}"
         )
     return 0
@@ -2119,7 +2157,27 @@ def _resolve(tex: Path, state: dict, args: argparse.Namespace, accept: bool) -> 
             print("latex-draft: no pending drafts")
             return 0
     else:
-        ids = [args.id]
+        if getattr(args, "block", None) is not None:
+            matches = [
+                d for d, r in state["drafts"].items()
+                if r.get("block") == args.block and r["status"] == "pending"
+            ]
+            if not matches:
+                print(
+                    f"latex-draft: no pending draft with block #{args.block}",
+                    file=sys.stderr,
+                )
+                return 2
+            if len(matches) > 1:
+                print(
+                    f"latex-draft: block #{args.block} is ambiguous "
+                    f"({', '.join(sorted(matches))}); use --id",
+                    file=sys.stderr,
+                )
+                return 2
+            ids = matches
+        else:
+            ids = [args.id]
         for did in ids:
             rec = state["drafts"].get(did)
             if rec is None:
@@ -3172,6 +3230,8 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help_text)
         g = p.add_mutually_exclusive_group(required=True)
         g.add_argument("--id", help="draft id (see `list`)")
+        g.add_argument("--block", type=int, metavar="N",
+                       help="block number N (see `list`, e.g. #2)")
         g.add_argument("--all", action="store_true", help="all pending drafts")
 
     sub.add_parser("compile", help="recompile the PDF (end every turn with this)")

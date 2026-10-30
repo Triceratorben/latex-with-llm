@@ -118,7 +118,8 @@ class ReportingCommands(Base):
         self.cli("accept", "--id", one)
         self.cli("list")
         rows = [l.split() for l in self.out.strip().splitlines()]
-        self.assertEqual(sorted(r[1] for r in rows), ["accepted", "pending"])
+        # list output starts with the block number (#N), then the draft id
+        self.assertEqual(sorted(r[2] for r in rows), ["accepted", "pending"])
         self.cli("status")
         self.assertIn("2 total, 1 pending", self.out)
         self.cli("changelog", "--last", "1")

@@ -154,9 +154,9 @@ All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
 | `draft-delete` | draft deleting existing text | `--old` (unique), `--file`, `--author` |
 | `draft-comment` | draft a comment at an anchor (Commenter mode) | `--after` / `--before` / `--at-line N`, `--text`, `--file`, `--author`, `--margin` |
 | `draft-preamble` | draft a preamble change (raw LaTeX between markers, not `\added`/`\deleted` — the changes package cannot typeset in the preamble; use for `\renewcommand`, `\setlength`, `\captionsetup`, font/geometry) | `--start` / `--end` / `--after <unique preamble line>` (exactly one), `--text` |
-| `list` | list drafts: id, status, op, preview | — |
-| `accept` | merge draft(s) into the file, removing markup | `--id <id>` or `--all` |
-| `reject` | discard draft(s), restoring original text | `--id <id>` or `--all` |
+| `list` | list drafts: block #, id, status, op, preview — each draft block is numbered `^N` in the PDF, matching its `#N` in `list` | — |
+| `accept` | merge draft(s) into the file, removing markup (and the `^N` marker) | `--id <id>`, `--block N`, or `--all` |
+| `reject` | discard draft(s), restoring original text | `--id <id>`, `--block N`, or `--all` |
 | `compile` | recompile the PDF; ends the turn (per-turn backup) | — |
 | `repair` | after a failed compile: analyze the log, apply safe fixes, suggest the rest | — |
 | `backup` | take a manual snapshot | `--note "..."` |

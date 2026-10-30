@@ -397,8 +397,9 @@ The user's message names which drafts to keep or discard. Execute:
 
 1. `latex-draft list` — confirm the current pending drafts and their ids.
 2. For each draft the user named:
-   - keep → `latex-draft accept --id <id>` (or `accept --all`)
-   - discard → `latex-draft reject --id <id>` (or `reject --all`)
+   - keep → `latex-draft accept --id <id>` or `accept --block N` (or `accept --all`)
+   - discard → `latex-draft reject --id <id>` or `reject --block N` (or `reject --all`)
+   (use `list` to see each draft's `#N` block number — the same number appears as a superscript at the start of the drafted text in the PDF, e.g. "keep block 2, reject block 1")
 3. If the user asks to undo something instead: `latex-draft undo --n K` or
    `latex-draft undo --turn`. Undo is **refuse-on-conflict**: a change is
    skipped (with a warning) if the file changed after it; use `undo --force`
@@ -446,9 +447,9 @@ All commands: `python3 tools/latex_draft.py <main.tex> <command> [options]`.
 | `draft-delete` | draft deleting existing text | `--old` (unique), `--file`, `--author` |
 | `draft-comment` | draft a comment at an anchor (Commenter mode) | `--after` / `--before` / `--at-line N`, `--text`, `--file`, `--author`, `--margin` |
 | `draft-preamble` | draft a preamble change (raw LaTeX, not changes-marked; for `\renewcommand`, `\setlength`, `\captionsetup`, font/geometry) | `--start` / `--end` / `--after <unique preamble line>` (exactly one), `--text` |
-| `list` | list drafts: id, status, op, preview | — |
-| `accept` | merge draft(s) into the file, removing markup | `--id <id>` or `--all` |
-| `reject` | discard draft(s), restoring original text | `--id <id>` or `--all` |
+| `list` | list drafts: block #, id, status, op, preview — each draft block shows a `^N` superscript in the PDF matching its `#N` | — |
+| `accept` | merge draft(s) into the file, removing markup (and the `^N` marker) | `--id <id>`, `--block N`, or `--all` |
+| `reject` | discard draft(s), restoring original text | `--id <id>`, `--block N`, or `--all` |
 | `compile` | recompile the PDF; ends the turn (per-turn backup) | — |
 | `repair` | after a failed compile: analyze the log, apply safe fixes, suggest the rest | — |
 | `backup` | take a manual snapshot | `--note "..."` |

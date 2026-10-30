@@ -86,6 +86,11 @@ HAVE_TEX = (
 class LoopCase(unittest.TestCase):
     """Fresh temp project per test; the CLI runs in-process."""
 
+    @staticmethod
+    def _strip_sup(text):
+        import re as _re
+        return _re.sub(r"^\\textsuperscript\{\d+\} ", "", text, flags=_re.MULTILINE) if False else _re.sub(r"\\textsuperscript\{\d+\} ", "", text)
+
     doc = LF_DOC
 
     def setUp(self):
@@ -794,19 +799,19 @@ class TestStructuralEditsAreRefused(LoopCase):
         self.assertEqual(
             self.cli("draft-insert", "--after", "Prose line.", "--text", "\\vspace{1em}"), 0
         )
-        self.assertIn("\\added[id=LLM]{\\vspace{1em}}", self.text())
+        self.assertIn("\\added[id=LLM]{\\vspace{1em}}", self._strip_sup(self.text()))
 
     def test_an_escaped_ampersand_is_text(self):
         self.assertEqual(
             self.cli("draft-replace", "--old", "Prose", "--new", "Smith \\& Jones"), 0
         )
-        self.assertIn("\\added[id=LLM]{Smith \\& Jones line.}", self.text())
+        self.assertIn("\\added[id=LLM]{Smith \\& Jones line.}", self._strip_sup(self.text()))
 
     def test_a_prose_line_break_can_be_drafted(self):
         self.assertEqual(
             self.cli("draft-insert", "--after", "Prose line.", "--text", "one \\\\ two"), 0
         )
-        self.assertIn("\\added[id=LLM]{one \\\\ two}", self.text())
+        self.assertIn("\\added[id=LLM]{one \\\\ two}", self._strip_sup(self.text()))
 
 
 @unittest.skipUnless(HAVE_TEX, "needs latexmk/pdflatex, pdftotext and the LaTeX packages")

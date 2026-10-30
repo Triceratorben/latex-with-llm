@@ -1,3 +1,4 @@
+import re
 import tempfile
 import time
 import unittest
@@ -55,6 +56,10 @@ class LatexDraftCase(unittest.TestCase):
         ordered += [d for d in state if d not in doc_order]
         return ordered
 
+    def strip_block_markers(self, text: str) -> str:
+        """Remove \\textsuperscript{N} block-number markers for assertions."""
+        return re.sub(r"\\textsuperscript\{\d+\} ", "", text)
+
 
 class TestChangesPackage(LatexDraftCase):
     def test_injects_package_after_documentclass(self):
@@ -82,7 +87,7 @@ class TestInsert(LatexDraftCase):
         text = self.tex.read_text()
         did = self.draft_ids()[0]
         self.assertIn(f"% latex-draft:{did}", text)
-        self.assertIn(r"\added[id=LLM]{New sentence.}", text)
+        self.assertIn(r"\added[id=LLM]{New sentence.}", self.strip_block_markers(text))
         self.assertIn(f"% latex-draft-end:{did}", text)
         self.assertIn("\\usepackage[draft]{changes}", text)
 
@@ -110,8 +115,8 @@ class TestReplaceDelete(LatexDraftCase):
         )
         self.assertEqual(rc, 0)
         text = self.tex.read_text()
-        self.assertIn(r"\deleted[id=LLM]{Small problems are worth studying.}", text)
-        self.assertIn(r"\added[id=LLM]{Big problems are worth studying.}", text)
+        self.assertIn(r"\deleted[id=LLM]{Small problems are worth studying.}", self.strip_block_markers(text))
+        self.assertIn(r"\added[id=LLM]{Big problems are worth studying.}", self.strip_block_markers(text))
 
     def test_replace_requires_unique_old(self):
         rc = self.run_cli("draft-replace", "--old", "o", "--new", "x")
@@ -121,7 +126,7 @@ class TestReplaceDelete(LatexDraftCase):
         rc = self.run_cli("draft-delete", "--old", "Small problems are worth studying.")
         self.assertEqual(rc, 0)
         text = self.tex.read_text()
-        self.assertIn(r"\deleted[id=LLM]{Small problems are worth studying.}", text)
+        self.assertIn(r"\deleted[id=LLM]{Small problems are worth studying.}", self.strip_block_markers(text))
         self.assertNotIn(r"\added", text)
 
 
@@ -139,7 +144,7 @@ class TestComment(LatexDraftCase):
         )
         self.assertEqual(rc, 0)
         text = self.tex.read_text()
-        self.assertIn(r"\footnote{TODO: cite a source here.}", text)
+        self.assertIn(r"\footnote{TODO: cite a source here.}", self.strip_block_markers(text))
         self.assertNotIn(r"\added", text)
         self.assertNotIn(r"\deleted", text)
         did = self.draft_ids()[0]
@@ -156,7 +161,7 @@ class TestComment(LatexDraftCase):
         did = self.draft_ids()[0]
         self.run_cli("accept", "--id", did)
         text = self.tex.read_text()
-        self.assertIn(r"\footnote{See related work.}", text)
+        self.assertIn(r"\footnote{See related work.}", self.strip_block_markers(text))
         self.assertNotIn("latex-draft:", text)
 
     def test_reject_comment_removes_footnote(self):
@@ -506,7 +511,7 @@ class TestMultiFile(LatexDraftCase):
         main_tex = self.tex.read_text()
         did = self.draft_ids()[0]
         self.assertIn(f"% latex-draft:{did}", chapter)
-        self.assertIn(r"\added[id=LLM]{Drafted chapter sentence.}", chapter)
+        self.assertIn(r"\added[id=LLM]{Drafted chapter sentence.}", self.strip_block_markers(chapter))
         # the main file gets the changes preamble (included files cannot
         # carry it) but no draft markers of its own
         self.assertNotIn("latex-draft:", main_tex)
@@ -524,8 +529,8 @@ class TestMultiFile(LatexDraftCase):
             "Rewritten chapter body.",
         )
         self.assertEqual(rc, 0)
-        self.assertIn(r"\deleted[id=LLM]{Chapter body text.}", self.chapter.read_text())
-        self.assertIn(r"\added[id=LLM]{Rewritten chapter body.}", self.chapter.read_text())
+        self.assertIn(r"\deleted[id=LLM]{Chapter body text.}", self.strip_block_markers(self.chapter.read_text()))
+        self.assertIn(r"\added[id=LLM]{Rewritten chapter body.}", self.strip_block_markers(self.chapter.read_text()))
 
     def test_accept_draft_in_chapter(self):
         self.run_cli(
@@ -564,7 +569,7 @@ class TestMultiFile(LatexDraftCase):
             "TODO: expand.",
         )
         self.assertEqual(rc, 0)
-        self.assertIn(r"\footnote{TODO: expand.}", self.chapter.read_text())
+        self.assertIn(r"\footnote{TODO: expand.}", self.strip_block_markers(self.chapter.read_text()))
 
     def test_file_must_be_an_input(self):
         stranger = self.dir / "stranger.tex"
@@ -738,7 +743,7 @@ class TestNestedFiles(LatexDraftCase):
         self.assertEqual(rc, 0)
         sub = self.sub.read_text()
         self.assertIn("latex-draft:", sub)
-        self.assertIn(r"\added[id=LLM]{Nested draft.}", sub)
+        self.assertIn(r"\added[id=LLM]{Nested draft.}", self.strip_block_markers(sub))
         did = self.draft_ids()[0]
         self.assertEqual(self.state()["drafts"][did]["file"], "sub.tex")
         # intermediate and main files untouched
@@ -817,8 +822,8 @@ class TestAuthorLabeling(LatexDraftCase):
             "Version B.",
         )
         text = self.tex.read_text()
-        self.assertIn(r"\added[id=A]{Version A.}", text)
-        self.assertIn(r"\added[id=B]{Version B.}", text)
+        self.assertIn(r"\added[id=A]{Version A.}", self.strip_block_markers(text))
+        self.assertIn(r"\added[id=B]{Version B.}", self.strip_block_markers(text))
         self.assertIn(r"\definechangesauthor[color=blue,name=A]{A}", text)
         self.assertIn(r"\definechangesauthor[color=orange,name=B]{B}", text)
         # draft records carry the author
@@ -859,7 +864,7 @@ class TestMarginComments(LatexDraftCase):
         )
         self.assertEqual(rc, 0)
         text = self.tex.read_text()
-        self.assertIn(r"\todo{Check this.}", text)
+        self.assertIn(r"\todo{Check this.}", self.strip_block_markers(text))
         self.assertIn(r"\usepackage{todonotes}", text)
         self.assertNotIn(r"\footnote", text)
 
@@ -874,7 +879,7 @@ class TestMarginComments(LatexDraftCase):
         )
         did = self.draft_ids()[0]
         self.run_cli("accept", "--id", did)
-        self.assertIn(r"\todo{Check this.}", self.tex.read_text())
+        self.assertIn(r"\todo{Check this.}", self.strip_block_markers(self.tex.read_text()))
         self.assertNotIn("latex-draft:", self.tex.read_text())
 
     def test_reject_margin_comment_removes_it(self):
@@ -1207,8 +1212,8 @@ class TestMultiParagraphDrafts(LatexDraftCase):
         from tools.latex_draft import build_block
 
         block = build_block("aaaaaaaa", new="Para one.\n\nPara two.", author="LLM")
-        self.assertIn(r"\added[id=LLM]{Para one.}", block)
-        self.assertIn(r"\added[id=LLM]{Para two.}", block)
+        self.assertIn(r"\added[id=LLM]{Para one.}", self.strip_block_markers(block))
+        self.assertIn(r"\added[id=LLM]{Para two.}", self.strip_block_markers(block))
 
     def test_replace_multi_paragraph_roundtrip(self):
         self.run_cli(
@@ -1221,7 +1226,7 @@ class TestMultiParagraphDrafts(LatexDraftCase):
         did = self.draft_ids()[0]
         text = self.tex.read_text()
         # two \added commands, one per paragraph
-        self.assertEqual(text.count(r"\added[id=LLM]{"), 2)
+        self.assertEqual(self.strip_block_markers(text).count(r"\added[id=LLM]{"), 2)
         # accept reassembles the paragraphs with a blank line
         self.run_cli("accept", "--id", did)
         text = self.tex.read_text()
@@ -1258,7 +1263,7 @@ class TestMultiParagraphDrafts(LatexDraftCase):
         )
         self.assertEqual(rc, 0)
         text = self.tex.read_text()
-        self.assertEqual(text.count(r"\deleted[id=LLM]{"), 2)
+        self.assertEqual(self.strip_block_markers(text).count(r"\deleted[id=LLM]{"), 2)
         did = self.draft_ids()[0]
         self.run_cli("accept", "--id", did)
         text = self.tex.read_text()
@@ -1283,7 +1288,7 @@ class TestMultiParagraphDrafts(LatexDraftCase):
             "One paragraph only.",
         )
         text = self.tex.read_text()
-        self.assertEqual(text.count(r"\added[id=LLM]{"), 1)
+        self.assertEqual(self.strip_block_markers(text).count(r"\added[id=LLM]{"), 1)
 
 
 class TestDraftPreamble(LatexDraftCase):
