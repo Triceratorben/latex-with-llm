@@ -1,0 +1,8 @@
+[project]
+name = "latex-with-llm"
+version = "0.1.0"
+description = "Turn-based, draft-marked LaTeX editing driven by an LLM (voice-friendly)"
+requires-python = ">=3.10"
+
+[project.scripts]
+latex-draft = "tools.latex_draft:main"
