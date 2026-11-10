@@ -82,8 +82,11 @@ DEFAULT_CONFIG = {"keep_markup": True, "color": "darkgreen", "style": "added"}
 # cannot break every compile with an undefined color.
 COLOR_ALIASES = {"grey": "gray", "lightgrey": "lightgray", "darkgrey": "darkgray", "darkgreen": "green!60!black"}
 # Accepted LLM text, kept marked so the review PDF still shows what the model
-# wrote; the changes package prints it plainly in final mode.
-PROVENANCE_CMD_RE = re.compile(r"\\(?:added|highlight)(?:\[[^\]]*\])?\{")
+# wrote; the changes package prints it plainly in final mode. \replaced is
+# included because its arguments are equally un-nestable: a draft built
+# inside \replaced{...}{...} produces markup the changes package cannot
+# compile. Group 1 is the command name.
+PROVENANCE_CMD_RE = re.compile(r"\\(added|highlight|replaced)(?:\[[^\]]*\])?\{")
 # Content that cannot sit inside \added{...}/\deleted{...}: the markup is
 # ulem text markup. Environment boundaries and alignment tabs are compile
 # errors ("Not in outer par mode", "Missing } inserted") that would otherwise
@@ -1233,27 +1236,44 @@ def _has_label_notes(tex: Path, state: dict) -> bool:
 
 
 def _provenance_span(text: str, index: int) -> tuple[int, int] | None:
-    """Span of the `\\added{...}`/`\\highlight{...}` command containing `index`.
+    """Span of the `\\added{...}`/`\\highlight{...}`/`\\replaced{...}{...}`
+    command containing `index`.
 
     The changes package cannot nest its commands, so a draft must not be built
-    inside accepted provenance markup.
+    inside accepted provenance markup. For `\\replaced[...]{new}{old}` both
+    arguments are covered (the whitespace between them may be a line break).
     """
     for m in PROVENANCE_CMD_RE.finditer(text):
         if m.start() > index:
             break
-        depth, i = 1, m.end()
-        while i < len(text) and depth:
-            ch = text[i]
-            if ch == "\\":
-                i += 2
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-            i += 1
-        if m.start() <= index < i:
-            return m.start(), i
+
+        def arg_end(j: int) -> int | None:
+            depth = 1
+            while j < len(text) and depth:
+                ch = text[j]
+                if ch == "\\":
+                    j += 2
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                j += 1
+            return j if depth == 0 else None
+
+        end = arg_end(m.end())
+        if end is None:
+            continue
+        if m.group(1) == "replaced":
+            k = end
+            while k < len(text) and text[k] in " \t\r\n":
+                k += 1
+            if k < len(text) and text[k] == "{":
+                end2 = arg_end(k + 1)
+                if end2 is not None:
+                    end = end2
+        if m.start() <= index < end:
+            return m.start(), end
     return None
 
 
@@ -1320,6 +1340,11 @@ def _unprotect_fragile(content: str) -> str:
     )
 
 
+SIBLING_WRAPPER_RE = re.compile(
+    r"\\(?:added|deleted|highlight|footnote|todo)(?:\[[^\]]*\])?\{"
+)
+
+
 def _brace_matching_sub(text: str, cmd: str, keep: bool, eat_space: bool = False) -> str:
     r"""Replace every \cmd[..]{balanced} in text by its inner content
     (keep=True) or by "" (keep=False), with real brace matching so nested
@@ -1331,7 +1356,10 @@ def _brace_matching_sub(text: str, cmd: str, keep: bool, eat_space: bool = False
     with a separator space, and dropping only the command would leave a
     doubled space (or a stray leading one at a line start). Spaces that were
     in the document before the draft (comment alignment, indentation) are
-    never adjacent to a wrapper and so are not touched."""
+    never adjacent to a wrapper and so are not touched. The heuristic is
+    exact only for diffs verified byte-exact by _inline_diff_exact — draft
+    paths that cannot verify fall back to the whole-span form, whose views
+    resolve exactly under this rule."""
     pat = re.compile(rf"\\{cmd}(?:\[[^\]]*\])?\{{")
     out: list[str] = []
     i = 0
@@ -1459,13 +1487,41 @@ def _inline_views(body: str) -> tuple[str, str]:
 def _inline_diff_exact(
     before: str, old: str, after: str, new: str, diff: str
 ) -> bool:
-    """Whether the diffed block body resolves byte-exactly: accept must give
-    `before + new + after`, reject must give `before + old + after`. A diff
-    that cannot (e.g. it eats into the neighbouring text) is worse than the
-    whole-span fallback and is discarded."""
+    """Whether the diffed block body resolves view-exactly: accept must give
+    the accept view of `before + new + after`, reject the reject view of
+    `before + old + after`. The comparison runs through the same resolver on
+    both sides, so accepted markup already standing in the context (`\added`
+    inside a host block's plain text) strips out equally from both and does
+    not mask a bad diff -- but a diff that eats into the neighbouring text
+    (e.g. a word move that welds two words) still fails and is discarded in
+    favour of the whole-span fallback."""
     body = before + diff + after
     acc, rej = _inline_views(body)
-    return acc == before + new + after and rej == before + old + after
+    return (
+        acc == _inline_views(before + new + after)[0]
+        and rej == _inline_views(before + old + after)[1]
+    )
+
+
+def _word_diff_verified(
+    before: str, old: str, after: str, new: str, author: str
+) -> str | None:
+    """The best word-level inline diff of old -> new that resolves
+    byte-exactly in the context `before`/`after`: accept must give
+    `before + new + after`, reject must give `before + old + after`. Tries
+    both equal-span whitespace variants (and the separator form); returns
+    None when no variant resolves exactly — the caller then uses the
+    whole-span form, which always does. Every draft path that splices a word
+    diff into an existing block body MUST go through this check: an
+    unverified word move used to resolve accept correctly but corrupt the
+    line on reject (the moved separator space was lost)."""
+    for variant in (("new", False), ("new", True), ("old", False), ("old", True)):
+        cand = _word_diff_inline(
+            old, new, author, equal_variant=variant[0], separator=variant[1]
+        )
+        if cand is not None and _inline_diff_exact(before, old, after, new, cand):
+            return cand
+    return None
 
 
 def _word_diff_inline(
@@ -1572,14 +1628,7 @@ def build_inline_block(
     and after `old`; `new` replaces `old`. The block body is a single line:
     `before` + inline diff + `after`.
     """
-    diff = None
-    for variant in (("new", False), ("new", True), ("old", False), ("old", True)):
-        cand = _word_diff_inline(
-            old, new, author, equal_variant=variant[0], separator=variant[1]
-        )
-        if cand is not None and _inline_diff_exact(before, old, after, new, cand):
-            diff = cand
-            break
+    diff = _word_diff_verified(before, old, after, new, author)
     if diff is None:
         # fall back: wrap old->new directly; a pure deletion (empty new)
         # emits no \added — an empty \\added{} is a no-op command and
@@ -1807,6 +1856,7 @@ def _insert_position(
             extra = ""
             if len(hits) != 1:
                 raw_text = "\n".join(lines)
+                raw_relaxed = _relax_blocks(raw_text)
                 masked_count = _mask_comments_and_blocks(raw_text).count(needle)
                 raw_count = raw_text.count(needle)
                 # an inline draft block splits the phrase across markup
@@ -1825,7 +1875,7 @@ def _insert_position(
                             m.group(1)
                             for m in BLOCK_RE.finditer(raw_text)
                             if needle in m.group(2)
-                            or needle in _relax_blocks(m.group(2))
+                            or needle in raw_relaxed[m.start(2) : m.end(2)]
                         }
                     )
                     where = (
@@ -2582,6 +2632,29 @@ def _mask_comments_and_blocks(text: str) -> str:
     return "".join(res)
 
 
+def _mask_comments_only(text: str) -> str:
+    """Same-length copy of `text` with % comment tails blanked but pending
+    draft blocks KEPT: the counterpart of _mask_comments_and_blocks, used to
+    check that a span found in the relaxed view is not inside a comment."""
+    out = list(text)
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "%":
+            j = i
+            while j < n and text[j] not in "\r\n":
+                out[j] = " "
+                j += 1
+            i = j
+            continue
+        i += 1
+    return "".join(out)
+
+
 def _plain_block_text(body: str) -> str:
     r"""A block body with every wrapper command removed whole (contents
     included): only the plain, unchanged words of the line remain. An --old
@@ -2717,6 +2790,36 @@ def _relax_blocks(text: str) -> str:
     return "".join(out)
 
 
+def _pending_wrapper_span(text: str, start: int, end: int) -> str | None:
+    r"""Id of the pending draft block whose \added/\deleted/... command the
+    character span [start, end) overlaps, or None when the span is plain
+    (unchanged) text. A span inside a pending wrapper's argument is the text
+    that draft adds or deletes — not yet part of the document — so neither a
+    marked draft nor an --unmarked patch may splice it."""
+    for m in BLOCK_RE.finditer(text):
+        body = m.group(2)
+        bstart = m.start(2)
+        for wm in SIBLING_WRAPPER_RE.finditer(body):
+            depth, i = 1, wm.end()
+            while i < len(body) and depth:
+                ch = body[i]
+                if ch == "\\":
+                    i += 2
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                i += 1
+            if depth:
+                continue
+            ws = bstart + wm.start()
+            we = bstart + i
+            if start < we and end > ws:
+                return m.group(1)
+    return None
+
+
 def _boundary_compose_target(text: str, old: str):
     """A pending inline draft block whose line, joined with the line that
     follows the block, contains `old` exactly once across the block boundary
@@ -2791,11 +2894,45 @@ def _whitespace_flexible_match(text: str, old: str) -> bool:
     return pat.search(text) is not None
 
 
+def _accepted_markup_straddle(text: str, old: str) -> str | None:
+    r"""Refusal message for an --old that matches only across accepted
+    provenance markup: an anchor straddling `\added{...}`,
+    `\highlight{...}` or `\replaced{...}{...}` (e.g. `--old "is debating
+    the law"` against `The senate \added[id=AI]{is} debating the law.`).
+    The raw text has no literal occurrence (the wrapper's closing brace is in
+    the way), so this used to surface as a bare "not found" even though the
+    words are plainly there. Returns None when the straddle is not the
+    explanation."""
+    if _mask_comments_and_blocks(text).count(old):
+        return None  # a visible match exists: not this problem
+    for m in PROVENANCE_CMD_RE.finditer(text):
+        span = _provenance_span(text, m.start())
+        if span is None:
+            continue
+        unwrapped = text[: m.start()] + text[m.end() : span[1] - 1] + text[span[1] :]
+        # unwrapping one command keeps (new + old) for \replaced; matching
+        # across either argument is enough to name the markup
+        if unwrapped.count(old) and text.count(old) == 0:
+            cmd = text[m.start() : span[1]]
+            shown = cmd if len(cmd) <= 60 else cmd[:57] + "..."
+            return (
+                "--old text crosses accepted \\added/\\highlight/\\replaced "
+                f"markup ({shown}); the changes package cannot nest there. "
+                "Re-draft over the whole command with --unmarked (--old "
+                "quoted as the entire command, --new as the replacement "
+                "text), or remove that markup first"
+            )
+    return None
+
+
 def _not_found_message(text: str, old: str) -> str:
     """The refusal for an --old with no literal occurrence, naming whitespace
     when only whitespace differs — a bare "not found" sends an agent that
     quoted hard-wrapped source (or read the phrase from the PDF) into a
     blind retry loop."""
+    straddle = _accepted_markup_straddle(text, old)
+    if straddle is not None:
+        return straddle
     if _whitespace_flexible_match(_mask_comments_and_blocks(text), old):
         return (
             "--old text not found in the document; the closest match differs "
@@ -2997,7 +3134,37 @@ def _unmarked_replace(
     """
     text = read_tex(target)
     visible = _mask_comments_and_blocks(text)
+    idx: int | None = None
     if visible.count(old) != 1:
+        # A pending inline point-edit block keeps the unchanged words of its
+        # line plain, so an --unmarked fix on that plain text is legitimate
+        # even while the block is pending (it used to be refused with
+        # "matched 0 times", blocking the direct repair of e.g. a corrupted
+        # line). Match against the relaxed view, whose block interiors are
+        # reduced to their plain text at unchanged offsets, and splice at the
+        # exact position.
+        relaxed = _relax_blocks(text)
+        j = relaxed.find(old)
+        if relaxed.count(old) == 1 and visible.count(old) == 0:
+            bad = _pending_wrapper_span(text, j, j + len(old))
+            if bad is not None:
+                print(
+                    f"latex-draft: --old text is inside the words the pending "
+                    f"point-edit draft ({bad}) adds or deletes; accept or "
+                    "reject that draft first",
+                    file=sys.stderr,
+                )
+                return 2
+            nocomment = _mask_comments_only(text)
+            if nocomment[j : j + len(old)] != old:
+                print(
+                    "latex-draft: --old text matched 0 times in the document "
+                    "text (outside % comments and draft blocks; need exactly 1)",
+                    file=sys.stderr,
+                )
+                return 2
+            idx = j
+    if idx is None and visible.count(old) != 1:
         print(
             f"latex-draft: --old text matched {visible.count(old)} times in "
             "the document text (outside % comments and draft blocks; "
@@ -3008,8 +3175,15 @@ def _unmarked_replace(
     replacement = "" if new is None else new
     preview = " ".join((new or old).split())[:60]
 
-    def fn(t: str) -> str:
-        return t.replace(old, replacement, 1)
+    if idx is not None:
+
+        def fn(t: str) -> str:
+            return t[:idx] + replacement + t[idx + len(old) :]
+
+    else:
+
+        def fn(t: str) -> str:
+            return t.replace(old, replacement, 1)
 
     try:
         mutate(tex, state, f"unmarked {op}: {preview}", fn, target=target)
@@ -3145,7 +3319,7 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
                         f"({host.group(1)}) changes; accept or reject that draft first"
                     )
                 rev2 = rev1.replace(old, "" if new is None else new, 1)
-                diff = _word_diff_inline(removed, rev2, author)
+                diff = _word_diff_verified("", removed, "", rev2, author)
                 if diff is None:
                     diff = (
                         _deleted_cmd(author)
@@ -3203,9 +3377,31 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
                 # this draft. Accepting the composed block merges both fixes;
                 # rejecting restores the original line. The host record is
                 # marked rejected (superseded_by) by the caller.
+                # _relax_blocks expects the FULL text (it blanks the marker
+                # lines around each block), so slice the relaxed whole-text
+                # copy per block — relaxing the bare body alone is a no-op
+                # and used to make this lookup raise a bare StopIteration
+                # when the anchor ended inside a pending \deleted{...} span.
+                idx = relaxed.index(old)
+                host_id = _pending_wrapper_span(text, idx, idx + len(old))
+                if host_id is not None:
+                    raise DraftError(
+                        "--old text overlaps the words a pending point-edit "
+                        f"draft ({host_id}) changes; accept or reject that "
+                        "draft first"
+                    )
                 host = next(
-                    m for m in matches if old in _relax_blocks(m.group(2))
+                    (m for m in matches if old in relaxed[m.start(2) : m.end(2)]),
+                    None,
                 )
+                if host is None:
+                    # The relaxed match spans a block's marker lines (only
+                    # possible across blanked marker text); never compose on
+                    # such a phantom occurrence.
+                    raise DraftError(
+                        "--old text matches only across a pending draft "
+                        "block; accept or reject that draft first"
+                    )
                 host_body = host.group(2)
                 host_rec = state["drafts"].get(host.group(1))
                 host_own = (host_rec or {}).get("own") or _wrapper_commands(host_body)
@@ -3224,8 +3420,30 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
                         _deleted_cmd(author)
                         + _escape_unbalanced_braces(_protect_fragile_in_deleted(old)) + "}"
                     )
+                if old not in host_body:
+                    # The relaxed match spans a wrapper boundary inside the
+                    # raw body (e.g. `law\deleted{x} today` matched relaxed as
+                    # `lawx today`); there is no literal splice point, so
+                    # never compose on it.
+                    raise DraftError(
+                        "--old text overlaps the words a pending point-edit "
+                        f"draft ({host.group(1)}) changes; accept or reject "
+                        "that draft first"
+                    )
+                if new is None or not new.strip():
+                    diff2 = (
+                        _deleted_cmd(author)
+                        + _escape_unbalanced_braces(_protect_fragile_in_deleted(old)) + "}"
+                    )
                 else:
-                    diff2 = _word_diff_inline(old, new, author)
+                    # Verify byte-exactly in the spliced context (the host
+                    # body around old): an unverified word move used to
+                    # resolve accept correctly but corrupt the line on
+                    # reject (bug-report-6, bug 1).
+                    p0 = host_body.index(old)
+                    diff2 = _word_diff_verified(
+                        host_body[:p0], old, host_body[p0 + len(old):], new, author
+                    )
                     if diff2 is None:
                         diff2 = (
                             _deleted_cmd(author)
@@ -3285,7 +3503,13 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
                         + _escape_unbalanced_braces(_protect_fragile_in_deleted(old)) + "}"
                     )
                 else:
-                    diff2 = _word_diff_inline(old, new, author)
+                    # Verify byte-exactly in the spliced context: the anchor
+                    # spans the block boundary, so the context is the host
+                    # body + separator + tail (ext), not the host body alone.
+                    p0 = ext.index(old)
+                    diff2 = _word_diff_verified(
+                        ext[:p0], old, ext[p0 + len(old):], new, author
+                    )
                     if diff2 is None:
                         diff2 = (
                             _deleted_cmd(author)
@@ -3335,11 +3559,11 @@ def _replace_or_delete(tex: Path, state: dict, args: argparse.Namespace, op: str
                 raise DraftError(_not_found_message(text, old))
         if _provenance_span(text, span[0]) is not None:
             raise DraftError(
-                "the text is inside accepted LLM markup (\\added/\\highlight), "
-                "which the changes package cannot nest; re-draft over the "
-                "whole \\added{...} command with --unmarked (the replacement "
-                "is plain text, so the provenance mark is dropped), or remove "
-                "that markup first"
+                "the text is inside accepted changes markup (\\added/"
+                "\\highlight/\\replaced), which the changes package cannot "
+                "nest; re-draft over the whole command with --unmarked (the "
+                "replacement is plain text, so the provenance mark is dropped "
+                "unless --new re-emits it), or remove that markup first"
             )
         start, stop = _line_span(text, span)
         _assert_body_text(text, start)
@@ -3601,9 +3825,13 @@ def cmd_list(tex: Path, state: dict, args: argparse.Namespace) -> int:
             if rec["status"] == "pending"
             else rec.get("preview", "")
         )
+        # The file column maps a block number seen in the PDF back to its
+        # file in a multi-file document (without it every file had to be
+        # grepped for its % latex-draft:<id> markers).
+        fname = rec.get("file") or "-"
         print(
             f"{block:<4} {did}  {rec['status']:<8}  {rec['op']:<7}  "
-            f"{rec['created']}  {preview}"
+            f"{rec['created']}  {fname:<20}  {preview}"
         )
     return 0
 
