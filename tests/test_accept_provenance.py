@@ -331,7 +331,10 @@ class TestEditOverAcceptedMarkup(ProvenanceCase):
                                     "--new", "worth fixing")
         self.assertEqual(rc, 2)
         self.assertEqual(self.tex.read_bytes(), before)
-        self.assertIn("not found", err)
+        # bug-report-6 bug 4: the anchor sits inside the accepted span, so
+        # the refusal names the markup instead of the false "not found"
+        self.assertIn("crosses accepted", err)
+        self.assertNotIn("not found", err)
 
     def test_refusal_message_names_the_working_unmarked_route(self):
         self.accept_point_edit()

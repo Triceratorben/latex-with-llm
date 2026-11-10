@@ -308,13 +308,17 @@ For display math, captions, sectioning titles and float interiors use
 / `draft-delete --unmarked`: the change is applied directly with no review
 markup, but it is snapshotted, changelogged and `undo`-able — say so when you
 report such a change. **Editing over accepted markup** (text already inside
-an `\added{...}`/`\highlight{...}` from an earlier accept) is refused for
-marked drafts — the changes package cannot nest. The route is
-`draft-replace --unmarked --old "<the whole \added[id=...]{...} command>"
---new "<plain text>"`: matching the inner words alone fails ("--old text not
-found"), and the marked whole-command edit is refused too. The replacement
-is plain text, so the accepted span's provenance mark is dropped — say so
-when you report the change. Other edits *inside* one line are fine and are the
+an `\added{...}`/`\highlight{...}`/`\replaced{...}{...}` from an earlier
+accept or from a co-author's tracked edits) is refused for marked drafts —
+the changes package cannot nest. The route is `draft-replace --unmarked`,
+and both anchors work: matching the inner words alone edits inside the
+wrapper and keeps it (and its author mark) as-is, and matching the whole
+`\added[id=...]{...}` command also works when you quote the exact command
+text in `--old` (re-emit the wrapper in `--new` if the mark must survive).
+An anchor that merely *straddles* the markup (starts outside, ends inside)
+is refused with a message naming the accepted command — never re-draft over
+a partial span. Without `--unmarked` the edit is refused; say so when you
+report the change. Other edits *inside* one line are fine and are the
 intended route for non-prose text: `\vspace{...}`, math such as `$x^2$` inside
 a sentence, or an escaped `\&`. Preamble-level
 changes go through `draft-preamble`. Content the markup cannot carry at all
