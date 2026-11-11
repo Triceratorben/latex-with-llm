@@ -1688,6 +1688,60 @@ TEXT_SAFE_CMDS = {
 }
 _BACKSLASH_CMD_RE = re.compile(r"\\([a-zA-Z]+)")
 
+# Bare special characters a reviewer's free text is full of, and the LaTeX
+# that keeps them visible instead of breaking the build. % starts a comment
+# and # is a macro-parameter character in EVERY mode, so they are escaped
+# unconditionally; _ and ^ are subscript/superscript operators, legal only
+# in math mode, so a $...$ span keeps them verbatim.
+_COMMENT_ESCAPE_ALWAYS = {"%": r"\%", "#": r"\#"}
+_COMMENT_ESCAPE_TEXT = {"_": r"\_", "^": r"\^{}"}
+
+# Non-ASCII symbols free text uses (arrows, comparisons, dashes, quotes):
+# pdfLaTeX with default encodings answers "! Package inputenc Error:
+# Unicode character ... not set up for use with LaTeX". The math ones need
+# math mode; the text ones have text-mode spellings.
+_COMMENT_MATH_SYMBOLS = {
+    "→": "\\rightarrow",
+    "←": "\\leftarrow",
+    "≤": "\\leq",
+    "≥": "\\geq",
+    "×": "\\times",
+    "÷": "\\div",
+    "±": "\\pm",
+    "≈": "\\approx",
+    "≠": "\\neq",
+    "−": "-",
+}
+_COMMENT_TEXT_SYMBOLS = {
+    "—": "---",
+    "–": "--",
+    "…": "\\ldots{}",
+    "“": "``",
+    "”": "''",
+    "‘": "`",
+    "’": "'",
+}
+
+
+def _unpaired_dollar_index(text: str) -> int:
+    """Index of the last unescaped '$' when their count is odd, else -1.
+
+    An even count of '$' pairs up into $...$ spans; an odd count means the
+    last one opens an unclosed math span that swallows the rest of the
+    footnote ("The fee is $5 per ride."), so that one must be escaped.
+    """
+    positions: list[int] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == "$":
+            positions.append(i)
+        i += 1
+    return positions[-1] if len(positions) % 2 == 1 else -1
+
 
 def _sanitize_comment_text(text: str) -> str:
     r"""Make comment text safe to typeset verbatim (see TEXT_SAFE_CMDS).
@@ -1696,11 +1750,22 @@ def _sanitize_comment_text(text: str) -> str:
     rendered literally as \textbackslash{}cmd — e.g. a dictated "the term is
     \mathrm{d}x" becomes visible text "\mathrm{d}x" instead of the fatal
     "! LaTeX Error: \mathrm allowed only in math mode."
+
+    Bare special characters are escaped so they stay visible instead of
+    breaking the build: a raw "50%" would comment out the closing brace the
+    tool appends (the note is silently truncated), "#" is illegal in a
+    footnote, "_"/"^" outside math answer "Missing $ inserted", and an odd
+    unpaired "$" opens math mode that swallows the rest of the note.
+    Already escaped forms (\%, \#, \$, \_, \&) pass through untouched, and
+    an even number of "$" keeps its $...$ math pairing (so $x_2$ stays
+    verbatim). Non-ASCII symbols (arrows, ≤, ×, dashes, curly quotes) are
+    spelled in LaTeX, which pdfLaTeX can typeset.
     """
     out: list[str] = []
     i = 0
     n = len(text)
     math = False
+    unpaired = _unpaired_dollar_index(text)
     while i < n:
         c = text[i]
         if c == "\\" and i + 1 < n:
@@ -1728,6 +1793,12 @@ def _sanitize_comment_text(text: str) -> str:
             i += 2
             continue
         if c == "$":
+            if i == unpaired:
+                # The last of an odd number of bare dollars: escape it so it
+                # prints instead of opening math to the end of the note.
+                out.append(r"\$")
+                i += 1
+                continue
             if text.startswith("$$", i):
                 math = not math
                 out.append("$$")
@@ -1735,6 +1806,23 @@ def _sanitize_comment_text(text: str) -> str:
                 continue
             math = not math
             out.append("$")
+            i += 1
+            continue
+        if c in _COMMENT_ESCAPE_ALWAYS:
+            out.append(_COMMENT_ESCAPE_ALWAYS[c])
+            i += 1
+            continue
+        if not math and c in _COMMENT_ESCAPE_TEXT:
+            out.append(_COMMENT_ESCAPE_TEXT[c])
+            i += 1
+            continue
+        if c in _COMMENT_MATH_SYMBOLS:
+            cmd = _COMMENT_MATH_SYMBOLS[c]
+            out.append(cmd if math else "$" + cmd + "$")
+            i += 1
+            continue
+        if c in _COMMENT_TEXT_SYMBOLS:
+            out.append(_COMMENT_TEXT_SYMBOLS[c])
             i += 1
             continue
         out.append(c)
@@ -2539,6 +2627,29 @@ def _insert_draft(
                     "later floats of the same class (no '!' error line). Anchor "
                     "before/after the environment instead, or use a plain % "
                     "comment in the source"
+                )
+        elif op == "comment":
+            # Comments only: draft-insert keeps its prior reach (a drafted
+            # line inside a float is the author's call). Anchor-only
+            # validation (marked=False): the marked-only table and
+            # display-math guards in insert_block stay the authority for
+            # those; this check catches the case LaTeX does NOT warn about.
+            lines = split_lines(text)
+            pos = _insert_position(
+                lines, "", args.after, args.before, args.at_line, marked=False
+            )
+            # A \\footnote inside a float (figure/table/...) compiles but the
+            # note text is silently dropped: floats cannot carry footnotes, so
+            # the reviewer would never see it. A \\caption line inside the
+            # float is the common case ("comment on this figure").
+            if _float_depth(lines, pos) > 0:
+                raise DraftError(
+                    "a \\footnote comment cannot be placed inside a float "
+                    "environment (figure/table/...): LaTeX silently drops the "
+                    "note text there — the mark is typeset but the note never "
+                    "appears (a \\caption line is the common case). Anchor the "
+                    "comment before/after the environment instead, or use a "
+                    "plain % comment in the source"
                 )
         return insert_block(
             text,
