@@ -313,7 +313,7 @@ class TestCommentPlacementRefusals(CommentCase):
             "\\definechangesauthor[color=green!60!black]{AI}\n"
             "\\begin{document}\n"
             "\\begin{equation}\n"
-            "E = mc^2\n"
+            "y = mx^2\n"
             "\\end{equation}\n"
             "\\end{document}\n"
         )
@@ -322,7 +322,7 @@ class TestCommentPlacementRefusals(CommentCase):
         self._math_doc()
         before = self.tex.read_bytes()
         rc, out, err = self.run_cli_err(
-            "draft-comment", "--after", "E = mc^2", "--text", "check this"
+            "draft-comment", "--after", "y = mx^2", "--text", "check this"
         )
         self.assertEqual(rc, 2)
         self.assertIn("display math", err)
@@ -332,7 +332,7 @@ class TestCommentPlacementRefusals(CommentCase):
         self._math_doc()
         before = self.tex.read_bytes()
         rc, out, err = self.run_cli_err(
-            "draft-comment", "--margin", "--after", "E = mc^2",
+            "draft-comment", "--margin", "--after", "y = mx^2",
             "--text", "check this",
         )
         self.assertEqual(rc, 2)
@@ -534,10 +534,10 @@ class TestCommentSpecialCharacters(CommentCase):
         self.assertNotRegex(body, r"(?<!\\)\$")
 
     def test_paired_dollars_keep_their_math_verbatim(self):
-        rc, out, err = self.draft("The energy is $E_mc^2$ per unit.")
+        rc, out, err = self.draft("The fit is $y_mx^2$ per unit.")
         self.assertEqual(rc, 0, err)
         # an even number of $ pairs up; _ and ^ inside math stay verbatim
-        self.assertIn(r"The energy is $E_mc^2$ per unit.", self.drafted_body())
+        self.assertIn(r"The fit is $y_mx^2$ per unit.", self.drafted_body())
 
     def test_unicode_symbols_are_spelled_in_latex(self):
         rc, out, err = self.draft("The relation a \u2192 b is unclear; also \u2264 and \u00d7.")
