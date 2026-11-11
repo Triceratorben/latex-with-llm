@@ -23,6 +23,24 @@ rest, mirroring cases the draft tests already cover:
 * show --accepted previews a pending comment's footnote;
 * an anchor that also occurs in a % comment still matches the real line.
 
+And, from the suggested-tests review of the commenting feature:
+
+* reviewer-style free text: bare %, #, _ (outside math), ^ (outside math),
+  an odd unpaired $ and non-ASCII symbols (→, ≤, ×) are escaped or spelled
+  so they stay visible and the build survives; already-escaped forms and
+  $...$ math pass through; & is refused, never written;
+* anchors in different parts of a paper: prose/\item/theorem/abstract lines
+  work, a \section heading keeps the footnote in the body, and captions,
+  table rows and equation interiors are refused cleanly;
+* a six-comment review pass resolved out of drafting order: accepted
+  footnotes are exactly \footnote{<text>} with no block-number prefix or
+  marker lines, rejected ones leave no trace, and finalize keeps accepted
+  footnotes while dropping the \todo and todonotes;
+* a comment and an edit on the same sentence, in both orders, resolve
+  independently (and the Order-B refusal points at a working --at-line);
+* hard-wrapped sentences, multi-line comment text and unsafe --author
+  labels.
+
 Run:  python3 -m unittest discover -s tests
 """
 
@@ -32,7 +50,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.latex_draft import BLOCK_RE, load_state, main
+import sys as _sys
+
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+import rw_support  # noqa: E402
+
+from tools.latex_draft import BLOCK_RE, load_state, main  # noqa: E402
 
 DOC = (
     "\\documentclass{article}\n"
@@ -416,6 +439,521 @@ class TestCommentResolution(CommentCase):
         self.assertIn(r"\footnote{pending note}", out.getvalue())
         # the body text is untouched
         self.assertIn("Second line follows.", out.getvalue())
+
+
+PAPER = (
+    "\\documentclass{article}\n"
+    "\\usepackage{amsthm}\n"
+    "\\newtheorem{theorem}{Theorem}\n"
+    "\\begin{document}\n"
+    "\\begin{abstract}\n"
+    "This paper studies a waiting line.\n"
+    "\\end{abstract}\n"
+    "\\section{Introduction}\n"
+    "We study a queue at a bakery counter.\n"
+    "\\begin{itemize}\n"
+    "\\item Arrivals are counted by hand.\n"
+    "\\end{itemize}\n"
+    "\\begin{theorem}\n"
+    "Every queue shortens eventually.\n"
+    "\\end{theorem}\n"
+    "\\begin{equation}\n"
+    "q = 2 b + 1\n"
+    "\\end{equation}\n"
+    "\\begin{table}\n"
+    "\\begin{tabular}{ll}\n"
+    "Mon & 3 \\\\\n"
+    "Tue & 5 \\\\\n"
+    "\\end{tabular}\n"
+    "\\end{table}\n"
+    "\\begin{figure}\n"
+    "\\centering\n"
+    "\\fbox{placeholder}\n"
+    "\\caption{A placeholder figure.}\n"
+    "\\end{figure}\n"
+    "The closing paragraph sums up the study.\n"
+    "\\end{document}\n"
+)
+
+
+class PaperCase(CommentCase):
+    """A realistic paper with abstract, theorem, equation, table, figure."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_doc(PAPER)
+
+
+class TestCommentSpecialCharacters(CommentCase):
+    """Reviewer-style free text: the special-character rows must either be
+    escaped so they stay visible (and the build survives) or be refused
+    cleanly with the file untouched. Probes the rows of the suggested-tests
+    table one by one; the control rows must pass unchanged."""
+
+    def draft(self, text):
+        rc, out, err = self.run_cli_err(
+            "draft-comment", "--after", "Second line follows.", "--text", text
+        )
+        return rc, out, err
+
+    def drafted_body(self):
+        text = self.tex.read_text()
+        blocks = self.blocks(text)
+        self.assertEqual(len(blocks), 1)
+        return blocks[0][1]
+
+    def test_percent_is_escaped(self):
+        rc, out, err = self.draft("Is 50% the right figure here?")
+        self.assertEqual(rc, 0, err)
+        body = self.drafted_body()
+        self.assertIn(r"Is 50\% the right figure here?", body)
+        self.assertNotIn("50%}", body)  # not truncated at the raw %
+
+    def test_hash_is_escaped(self):
+        rc, out, err = self.draft("See issue #3 and item #2.")
+        self.assertEqual(rc, 0, err)
+        self.assertIn(r"issue \#3 and item \#2.", self.drafted_body())
+
+    def test_underscore_outside_math_is_escaped(self):
+        rc, out, err = self.draft("The variable E_F is not defined before use.")
+        self.assertEqual(rc, 0, err)
+        self.assertIn(r"The variable E\_F is", self.drafted_body())
+
+    def test_caret_outside_math_is_escaped(self):
+        rc, out, err = self.draft("Check the scaling x^2 here.")
+        self.assertEqual(rc, 0, err)
+        self.assertIn(r"scaling x\^{}2 here.", self.drafted_body())
+
+    def test_lone_dollar_is_escaped(self):
+        rc, out, err = self.draft("The fee is $5 per ride.")
+        self.assertEqual(rc, 0, err)
+        body = self.drafted_body()
+        self.assertIn(r"The fee is \$5 per ride.", body)
+        # the escaped dollar must not open math that swallows the rest:
+        # no unescaped $ may remain anywhere in the note
+        self.assertNotRegex(body, r"(?<!\\)\$")
+
+    def test_paired_dollars_keep_their_math_verbatim(self):
+        rc, out, err = self.draft("The energy is $E_mc^2$ per unit.")
+        self.assertEqual(rc, 0, err)
+        # an even number of $ pairs up; _ and ^ inside math stay verbatim
+        self.assertIn(r"The energy is $E_mc^2$ per unit.", self.drafted_body())
+
+    def test_unicode_symbols_are_spelled_in_latex(self):
+        rc, out, err = self.draft("The relation a \u2192 b is unclear; also \u2264 and \u00d7.")
+        self.assertEqual(rc, 0, err)
+        body = self.drafted_body()
+        self.assertIn("a $\\rightarrow$ b", body)
+        self.assertIn("$\\leq$", body)
+        self.assertIn("$\\times$", body)
+        self.assertNotIn("\u2192", body)
+
+    def test_url_special_characters_are_escaped(self):
+        rc, out, err = self.draft("See https://example.org/a_b?x=50%25#c")
+        self.assertEqual(rc, 0, err)
+        body = self.drafted_body()
+        self.assertIn(r"a\_b?x=50\%25\#c", body)
+
+    def test_ampersand_is_refused_not_written(self):
+        original = self.tex.read_bytes()
+        rc, out, err = self.draft("Use R&D consistently.")
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.tex.read_bytes(), original)
+        self.assertTrue(out.strip() or err.strip())  # the refusal says why
+
+    def test_mathrm_control_row_passes_through(self):
+        rc, out, err = self.draft(
+            "The term \\mathrm{d}x and \\cite{smith2020} [3]."
+        )
+        self.assertEqual(rc, 0, err)
+        body = self.drafted_body()
+        # math-only command is spelled out visibly; \cite is text-safe
+        self.assertIn(r"\textbackslash{}mathrm{d}x", body)
+        self.assertIn(r"\cite{smith2020}", body)
+
+    def test_special_characters_round_trip_on_accept_and_reject(self):
+        text = "Is 50% the right figure here?"
+        rc, out, err = self.draft(text)
+        self.assertEqual(rc, 0, err)
+        did = self.pending_ids()[0]
+        self.assertEqual(self.run_cli("accept", "--id", did), 0)
+        self.assertIn(
+            r"\footnote{Is 50\% the right figure here?}", self.tex.read_text()
+        )
+        # a fresh draft: reject must restore the original bytes exactly
+        before = self.tex.read_bytes()
+        self.assertEqual(self.draft(text)[0], 0)
+        did = self.pending_ids()[0]
+        self.assertEqual(self.run_cli("reject", "--id", did), 0)
+        self.assertEqual(self.tex.read_bytes(), before)
+
+
+@rw_support.needs_tex
+class TestCommentSpecialCharactersCompile(PaperCase):
+    """The escaped comment text must still compile (needs a TeX engine)."""
+
+    def test_escaped_rows_compile(self):
+        rows = [
+            "Is 50% the right figure here?",
+            "See issue #3 and item #2.",
+            "The variable E_F is not defined before use.",
+            "Check the scaling x^2 here.",
+            "The fee is $5 per ride.",
+        ]
+        for row in rows:
+            with self.subTest(row=row):
+                rc, out, err = self.run_cli_err(
+                    "draft-comment", "--after", "We study a queue",
+                    "--text", row,
+                )
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(self.run_cli("accept", "--all"), 0)
+                # the accepted note must not break the build
+                self.assertEqual(self.run_cli("compile"), 0)
+
+
+class TestCommentPaperParts(PaperCase):
+    """Comments anchored in different parts of a paper (suggested test 2)."""
+
+    def test_prose_item_theorem_and_abstract_lines_take_comments(self):
+        for anchor in (
+            "We study a queue at a bakery counter.",
+            "\\item Arrivals are counted by hand.",
+            "Every queue shortens eventually.",
+            "This paper studies a waiting line.",
+        ):
+            with self.subTest(anchor=anchor):
+                rc, out, err = self.run_cli_err(
+                    "draft-comment", "--after", anchor, "--text", "note"
+                )
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(self.run_cli("reject", "--all"), 0)
+
+    def test_section_heading_comment_sits_in_the_body(self):
+        rc, out, err = self.run_cli_err(
+            "draft-comment", "--after", "\\section{Introduction}",
+            "--text", "Section reads well.",
+        )
+        self.assertEqual(rc, 0, err)
+        text = self.tex.read_text()
+        # the title itself is untouched: the footnote is a whole line after it
+        self.assertIn("\\section{Introduction}\n% latex-draft:", text)
+        self.assertNotIn("\\section{Introduction\\footnote", text)
+        self.assertLess(
+            text.index("\\footnote"), text.index("We study a queue")
+        )
+        # ... and a --margin note works there too (the docs recommend it)
+        self.assertEqual(self.run_cli("reject", "--all"), 0)
+        rc, out, err = self.run_cli_err(
+            "draft-comment", "--after", "\\section{Introduction}",
+            "--text", "Margin on the heading.", "--margin",
+        )
+        self.assertEqual(rc, 0, err)
+
+    def test_caption_footnote_is_refused(self):
+        original = self.tex.read_bytes()
+        rc, out, err = self.run_cli_err(
+            "draft-comment", "--after", "\\caption{A placeholder figure.}",
+            "--text", "Is this figure needed?",
+        )
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.tex.read_bytes(), original)
+        # the refusal says what to do instead
+        self.assertIn("float", out + err)
+        # --margin is refused inside a float too (documented)
+        rc, out, err = self.run_cli_err(
+            "draft-comment", "--after", "\\caption{A placeholder figure.}",
+            "--text", "Is this figure needed?", "--margin",
+        )
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.tex.read_bytes(), original)
+
+    def test_table_row_comment_is_refused(self):
+        original = self.tex.read_bytes()
+        for extra in ([], ["--margin"]):
+            with self.subTest(margin=bool(extra)):
+                rc, out, err = self.run_cli_err(
+                    "draft-comment", "--after", "Mon & 3 \\\\",
+                    "--text", "Check this row.", *extra,
+                )
+                self.assertEqual(rc, 2)
+                self.assertEqual(self.tex.read_bytes(), original)
+
+    def test_equation_interior_comment_is_refused(self):
+        original = self.tex.read_bytes()
+        for extra in ([], ["--margin"]):
+            with self.subTest(margin=bool(extra)):
+                rc, out, err = self.run_cli_err(
+                    "draft-comment", "--after", "q = 2 b + 1",
+                    "--text", "Check this formula.", *extra,
+                )
+                self.assertEqual(rc, 2)
+                self.assertEqual(self.tex.read_bytes(), original)
+
+
+class TestCommentMixedResolution(PaperCase):
+    """A normal review pass resolved in a mixed order (suggested test 3)."""
+
+    def setUp(self):
+        super().setUp()
+        # six paragraphs, no hand-written changes preamble: the tool injects
+        # what it needs, so `check`/`finalize` see a realistic state
+        self.write_doc(
+            "\\documentclass{article}\n"
+            "\\begin{document}\n"
+            "One: the first paragraph stands alone here.\n"
+            "Two: the second paragraph follows the first.\n"
+            "Three: the third paragraph is shorter still.\n"
+            "Four: the fourth paragraph mentions the queue.\n"
+            "Five: the fifth paragraph closes the argument.\n"
+            "Six: the sixth paragraph is the last one here.\n"
+            "\\end{document}\n"
+        )
+
+    def draft_six(self):
+        notes = [
+            ("One: the first", "FOOTNOTE: Cite the source here.", False),
+            ("Two: the second", "Tighten this sentence.", False),
+            ("Three: the third", "FOOTNOTE: Define the queue length.", False),
+            ("Four: the fourth", "Check the number.", False),
+            ("Five: the fifth", "Margin: rewrite later.", True),
+            ("Six: the sixth", "Margin: add a citation.", True),
+        ]
+        for anchor, text, margin in notes:
+            argv = ["draft-comment", "--after", anchor, "--text", text]
+            if margin:
+                argv.append("--margin")
+            self.assertEqual(self.run_cli(*argv), 0)
+
+    def test_mixed_order_resolution(self):
+        self.draft_six()
+        # resolve out of drafting order: accept 5, 1, 3; reject 6, 2, 4
+        for block, want in ((6, "reject"), (5, "accept"), (2, "reject"),
+                            (1, "accept"), (4, "reject"), (3, "accept")):
+            self.assertEqual(self.run_cli(want, "--block", str(block)), 0)
+        text = self.tex.read_text()
+        # accepted footnotes: exactly the original --text, no block-number
+        # prefix, no marker lines, on the line after the anchor
+        self.assertIn(
+            "One: the first paragraph stands alone here.\n"
+            "\\footnote{FOOTNOTE: Cite the source here.}\n",
+            text,
+        )
+        self.assertIn(
+            "Three: the third paragraph is shorter still.\n"
+            "\\footnote{FOOTNOTE: Define the queue length.}\n",
+            text,
+        )
+        self.assertNotIn("\\textsuperscript", text)
+        self.assertNotIn("% latex-draft:", text)
+        # rejected comments leave no trace
+        self.assertNotIn("Tighten this sentence.", text)
+        self.assertNotIn("Check the number.", text)
+        # the accepted margin note is still there, and todonotes with it
+        self.assertIn("\\todo{Margin: rewrite later.}", text)
+        self.assertIn("\\usepackage{todonotes}", text)
+        self.assertEqual(self.run_cli("check"), 0)
+        # finalize: the todo goes, todonotes goes, the footnotes stay; the
+        # working copy is untouched
+        self.assertEqual(self.run_cli("finalize", "--out", str(self.dir / "clean")), 0)
+        clean = (self.dir / "clean" / "paper.tex").read_text()
+        self.assertNotIn("\\todo", clean)
+        self.assertNotIn("todonotes", clean)
+        self.assertIn("\\footnote{FOOTNOTE: Cite the source here.}", clean)
+        self.assertIn("\\footnote{FOOTNOTE: Define the queue length.}", clean)
+        self.assertIn("\\todo{Margin: rewrite later.}", self.tex.read_text())
+
+
+class TestCommentWithEdit(CommentCase):
+    """A comment and an edit on the same sentence (suggested test 4)."""
+
+    SENTENCE = "The fee is five euros per ride and riders complain."
+    NEW = "The fee is six euros per ride and riders complain."
+
+    def doc(self):
+        return (
+            "\\documentclass{article}\n"
+            "\\usepackage[draft]{changes}\n"
+            "\\definechangesauthor[color=green!60!black]{AI}\n"
+            "\\begin{document}\n"
+            + self.SENTENCE + "\n"
+            "\\end{document}\n"
+        )
+
+    def ids_by_op(self):
+        out = {}
+        for did, rec in self.state()["drafts"].items():
+            if rec["status"] == "pending":
+                out[rec["op"]] = did
+        return out
+
+    def test_order_a_comment_then_edit(self):
+        self.write_doc(self.doc())
+        self.assertEqual(
+            self.run_cli(
+                "draft-comment", "--after", "The fee is five euros",
+                "--text", "Why five?",
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.run_cli("draft-replace", "--old", self.SENTENCE,
+                         "--new", self.NEW),
+            0,
+        )
+        # both drafts stay pending
+        self.assertEqual(sorted(self.ids_by_op()), ["comment", "replace"])
+        # accept the comment, reject the edit: original sentence + footnote
+        ids = self.ids_by_op()
+        self.assertEqual(self.run_cli("accept", "--id", ids["comment"]), 0)
+        self.assertEqual(self.run_cli("reject", "--id", ids["replace"]), 0)
+        text = self.tex.read_text()
+        self.assertIn(self.SENTENCE + "\n\\footnote{Why five?}", text)
+        self.assertNotIn(self.NEW, text)
+
+    def test_order_a_edit_accepted_comment_rejected(self):
+        self.write_doc(self.doc())
+        self.assertEqual(
+            self.run_cli(
+                "draft-comment", "--after", "The fee is five euros",
+                "--text", "Why five?",
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.run_cli("draft-replace", "--old", self.SENTENCE,
+                         "--new", self.NEW),
+            0,
+        )
+        ids = self.ids_by_op()
+        self.assertEqual(self.run_cli("accept", "--id", ids["replace"]), 0)
+        self.assertEqual(self.run_cli("reject", "--id", ids["comment"]), 0)
+        text = self.tex.read_text()
+        self.assertIn(self.NEW, text)
+        self.assertNotIn("\\footnote", text)
+        self.assertNotIn(self.SENTENCE, text)
+
+    def test_order_b_edit_then_comment_refuses_with_a_working_fallback(self):
+        self.write_doc(self.doc())
+        self.assertEqual(
+            self.run_cli("draft-replace", "--old", self.SENTENCE,
+                         "--new", self.NEW),
+            0,
+        )
+        rc, out, err = self.run_cli_err(
+            "draft-comment", "--after", "The fee is five euros",
+            "--text", "Why five?",
+        )
+        # refused: the anchor only exists inside the pending draft block, and
+        # the message must lead somewhere (resolve, another anchor, --at-line)
+        self.assertEqual(rc, 2)
+        message = out + err
+        self.assertIn("pending draft", message)
+        self.assertIn("--at-line", message)
+        self.assertEqual(self.tex.read_text().count("\\footnote"), 0)
+        # the --at-line fallback: the first line after the pending block
+        lines = self.tex.read_text().splitlines()
+        end = max(
+            i for i, ln in enumerate(lines) if "latex-draft-end:" in ln
+        )
+        rc, out, err = self.run_cli_err(
+            "draft-comment", "--at-line", str(end + 2),
+            "--text", "Why five?",
+        )
+        self.assertEqual(rc, 0, err)
+        text = self.tex.read_text()
+        # the comment must not land INSIDE the pending replace block (right
+        # after its opening marker line)
+        # the comment block sits OUTSIDE the pending replace block
+        comment_pos = text.index("\\footnote{")
+        block_end = text.index("% latex-draft-end:")
+        self.assertGreater(comment_pos, block_end)
+        # accepting the edit keeps the comment (still pending) next to the
+        # edited sentence
+        ids = self.ids_by_op()
+        self.assertEqual(self.run_cli("accept", "--id", ids["replace"]), 0)
+        text = self.tex.read_text()
+        self.assertIn(self.NEW, text)
+        self.assertIn("Why five?", text)
+        # accepting the comment too leaves the final footnote form
+        self.assertEqual(self.run_cli("accept", "--all"), 0)
+        self.assertIn("\\footnote{Why five?}", self.tex.read_text())
+
+
+class TestCommentAlsoWorthAdding(CommentCase):
+    """The cheap extras from the suggested-tests list."""
+
+    def test_hard_wrapped_sentence_block_never_splits_a_line(self):
+        self.write_doc(
+            "\\documentclass{article}\n"
+            "\\usepackage[draft]{changes}\n"
+            "\\definechangesauthor[color=green!60!black]{AI}\n"
+            "\\begin{document}\n"
+            "The queue grows on Mondays as the table shows, see\n"
+            "\\cite{smith2020} for the numbers and the method.\n"
+            "\\end{document}\n"
+        )
+        self.assertEqual(
+            self.run_cli(
+                "draft-comment", "--after", "The queue grows on Mondays",
+                "--text", "Split sentence: merge the lines?",
+            ),
+            0,
+        )
+        text = self.tex.read_text()
+        # the block is whole lines directly after the anchored line; the
+        # anchored line (and the \cite on the next one) are untouched
+        lines = text.splitlines()
+        anchor = next(
+            i for i, ln in enumerate(lines)
+            if "The queue grows on Mondays" in ln
+        )
+        self.assertTrue(lines[anchor + 1].startswith("% latex-draft:"))
+        self.assertTrue(lines[anchor + 2].startswith("\\footnote{"))
+        self.assertIn("\\cite{smith2020} for the numbers", text)
+
+    def test_multiline_comment_text_survives_accept_and_reject(self):
+        long_text = (
+            "First line of the note.\n\n"
+            "Second paragraph continues. And a very long tail that keeps "
+            "going and going and going to make sure nothing is truncated "
+            "anywhere in the pipeline at all."
+        )
+        original = self.tex.read_bytes()
+        self.assertEqual(
+            self.run_cli(
+                "draft-comment", "--after", "First line",
+                "--text", long_text,
+            ),
+            0,
+        )
+        did = self.pending_ids()[0]
+        self.assertEqual(self.run_cli("reject", "--id", did), 0)
+        self.assertEqual(self.tex.read_bytes(), original)
+        self.assertEqual(
+            self.run_cli(
+                "draft-comment", "--after", "First line",
+                "--text", long_text,
+            ),
+            0,
+        )
+        did = self.pending_ids()[0]
+        self.assertEqual(self.run_cli("accept", "--id", did), 0)
+        self.assertIn(long_text, self.tex.read_text())
+
+    def test_author_labels_with_special_characters_are_made_safe(self):
+        rc, out, err = self.run_cli_err(
+            "draft-comment", "--after", "First line",
+            "--text", "Note.", "--author", "R&D 50%",
+        )
+        self.assertEqual(rc, 0, err)
+        text = self.tex.read_text()
+        # the unsafe characters are stripped from the id (RD-50), which the
+        # preamble records and the block uses
+        self.assertIn("RD-50", text)
+        did = self.pending_ids()[0]
+        self.assertEqual(self.run_cli("accept", "--id", did), 0)
+        self.assertIn("\\footnote{Note.}", self.tex.read_text())
 
 
 if __name__ == "__main__":
