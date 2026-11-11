@@ -47,7 +47,7 @@ case for "write/edit my paper" requests); say which mode you assumed.
 - **Writer** — may use `draft-insert`, `draft-replace`, `draft-delete`,
   `draft-preamble` (and `draft-comment`). Responsible for making the
   concrete formulation and phrasing from the input of the user —
-  crystallizing the ideas, so to speak: turning rough spoken intent into
+  laying the mosaic stones, so to speak: turning rough spoken intent into
   precise, idiomatic scientific prose.
 - **Commenter** — may use **only** `draft-comment`. Adds comments that mark,
   question, or annotate the text. Never inserts, replaces, or deletes body
