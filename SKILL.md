@@ -519,6 +519,20 @@ back text) make no tool changes and need **no `compile`** — compiling would
 bump the turn counter and take a backup for nothing. End such turns with a
 plain reply.
 
+#### Chunking: one page at a time (default)
+
+**Unless the user explicitly asks for a whole-document pass** ("go through
+the whole paper", "do a full sweep", "review everything"), edit in **small
+chunks: about one page of text at a time** — one section, one paragraph
+block, or one screenful, whichever is smaller. Draft that chunk, `compile`,
+report its draft ids and previews, and **stop**: let the user accept or
+reject the chunk (REVIEW → RESOLVE) **before drafting the next one**. A page
+of pending markup is reviewable in the PDF; ten pages are not, and the user
+decides per chunk, not per file. Do not draft the entire document in one
+turn to save round-trips. Only when the user prompts for it should you do a
+whole-document pass — and even then, report the drafts chunk by chunk so
+the user can resolve them page by page.
+
 ### State 3: REVIEW (the user looks at the PDF)
 
 The compiled PDF is open in front of the user. You do nothing; the user
@@ -803,6 +817,9 @@ Before closing a session, finish with a **reference check**:
   tool → `compile`. Follow the state machine above: know your state
   (IDLE / TURN / REVIEW / RESOLVE) before every tool call and only use the
   commands that state allows.
+- Edit in chunks by default: roughly **one page of text per turn**, then
+  wait for the user's accept/reject before drafting the next chunk. A
+  whole-document pass only when the user asks for one.
 - Anchors (`--after`/`--before`/`--old`) must be unique in the target file;
   keep one sentence per line in the source.
 - Keep drafted LaTeX idiomatic; escape `%`, `&`, `#`, `_` etc. as needed.
